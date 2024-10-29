@@ -1,0 +1,1791 @@
+{
+  "metadata": {
+    "version": 1,
+    "created_at": "2024-10-28T22:40:52.683188",
+    "last_modified": "2024-10-28T22:40:52.683191"
+  },
+  "rows": [
+    {
+      "id": "really_purely_huge_quagga",
+      "experiment": {
+        "name": "grokking",
+        "task_description": "You are given the following file to work with, which studies the phenomenon of grokking in neural networks by training multiple small Transformer models on multiple datasets of mathematical operations. The abstract for the original paper is \"In this paper we propose to study generalization of neural networks on small algorithmically generated datasets. In this setting, questions about data efficiency, memorization, generalization, and speed of learning can be studied in great detail. In some situations we show that neural networks learn through a process of 'grokking' a pattern in the data, improving generalization performance from random chance level to perfect generalization, and that this improvement in generalization can happen well past the point of overfitting. We also study generalization as a function of dataset size and find that smaller datasets require increasing amounts of optimization for generalization. We argue that these datasets provide a fertile ground for studying a poorly understood aspect of deep learning: generalization of overparametrized neural networks beyond memorization of the finite training dataset.\" Please come up with interesting experiments to investigate this phenomenon.",
+        "init_code": "import abc\nimport argparse\nimport json\nimport os\nimport random\nfrom itertools import permutations\nfrom typing import Set\n\nimport numpy as np\nimport torch\nfrom einops import rearrange, repeat\nfrom torch import nn, Tensor\nfrom torch.utils.data import IterableDataset\n\n\nclass AbstractDataset(abc.ABC):\n    def __init__(self, group_elements1: Set, group_elements2: Set, frac_train: float):\n        self.frac_train = frac_train\n        self.group_elements1 = group_elements1\n        self.group_elements2 = group_elements2\n        self.ordered_group_elements1 = list(self.group_elements1)\n        self.ordered_group_elements2 = list(self.group_elements2)\n        self.idx2vocab = [\"o\", \"=\"] + list(group_elements1.union(group_elements2))\n        self.vocab2idx = {vocab: idx for idx, vocab in enumerate(self.idx2vocab)}\n        self.n_vocab = len(self.idx2vocab)\n        self.n_out = len(group_elements1.union(group_elements2))\n        idxs = list(range(len(self.group_elements1) * len(self.group_elements2)))\n        random.shuffle(idxs)\n        self.train_pairs, self.val_pairs = (\n            idxs[: int(len(idxs) * frac_train)],\n            idxs[int(len(idxs) * frac_train):],\n        )\n\n    @abc.abstractmethod\n    def fetch_output(self, a, b):\n        pass\n\n    def encode(self, sequence):\n        return [self.vocab2idx[item] for item in sequence]\n\n    def decode(self, sequence):\n        return [self.idx2vocab[item] for item in sequence]\n\n    def form_equation(self, a, b, c):\n        return [a, \"o\", b, \"=\", c]\n\n    def fetch_example(self, idx):\n        a = self.ordered_group_elements1[idx // len(self.group_elements2)]\n        b = self.ordered_group_elements2[idx % len(self.group_elements2)]\n        c = self.fetch_output(a, b)\n        equation = self.form_equation(a, b, c)\n        return self.encode(equation[:-1]), (self.vocab2idx[c] - 2), equation\n\n    def fetch_train_example(self):\n        idx = random.choice(self.train_pairs)\n        return self.fetch_example(idx)\n\n    def fetch_val_example(self):\n        idx = random.choice(self.val_pairs)\n        return self.fetch_example(idx)\n\n\nclass ModSumDataset(AbstractDataset):\n    def __init__(self, p, frac_train):\n        super(ModSumDataset, self).__init__(set(range(p)), set(range(p)), frac_train)\n        self.p = p\n\n    def fetch_output(self, a, b):\n        return (a + b) % self.p\n\n\nclass ModSubtractDataset(AbstractDataset):\n    def __init__(self, p, frac_train):\n        super(ModSubtractDataset, self).__init__(\n            set(range(p)), set(range(p)), frac_train\n        )\n        self.p = p\n\n    def fetch_output(self, a, b):\n        return (a - b) % self.p\n\n\nclass ModDivisonDataset(AbstractDataset):\n    def __init__(self, p, frac_train):\n        super(ModDivisonDataset, self).__init__(\n            set(range(p)), set(range(1, p)), frac_train\n        )\n        self.p = p\n\n    def fetch_output(self, a, b):\n        return (a * pow(b, self.p - 2, self.p)) % self.p\n\n\nclass PermutationGroup(AbstractDataset):\n    def __init__(self, k, frac_train):\n        perms = set(map(tuple, permutations(list(range(k)))))\n        super(PermutationGroup, self).__init__(perms, perms, frac_train)\n        self.k = k\n\n    def fetch_output(self, a, b):\n        return tuple([a[b[i]] for i in range(len(b))])\n\n\nclass GroupDataset(IterableDataset):\n    def __init__(self, dataset: AbstractDataset, split: str):\n        super(GroupDataset, self).__init__()\n        assert split in {\"train\", \"val\"}\n        self.dataset = dataset\n        self.split = split\n        self.fetch_f = None\n        if self.split == \"train\":\n            self.fetch_f = self.dataset.fetch_train_example\n        elif self.split == \"val\":\n            self.fetch_f = self.dataset.fetch_val_example\n        else:\n            raise NotImplementedError\n\n    def __iter__(self):\n        return self\n\n    def __next__(self):\n        x, y, _ = self.fetch_f()\n        return torch.tensor(x), torch.tensor(y)\n\n\ndef operation_mod_p_data(operation: str, p: int, frac_train: float):\n    \"\"\"\n    x◦y (mod p) for 0 <= x < p, 1 <= y < p if operation in DIVISION_MODULO_OPERATIONS\n    x◦y (mod p) for 0 <= x, y < p otherwise\n    \"\"\"\n    if operation == \"x_plus_y\":\n        data = ModSumDataset(p=p, frac_train=frac_train)\n    elif operation == \"x_minus_y\":\n        data = ModSubtractDataset(p=p, frac_train=frac_train)\n    elif operation == \"x_div_y\":\n        data = ModDivisonDataset(p=p, frac_train=frac_train)\n    elif operation == \"permutation\":\n        data = PermutationGroup(k=5, frac_train=frac_train)\n    return data\n\n\ndef get_data(operation: str, prime: int, training_fraction: float, batch_size: int):\n    dataset = operation_mod_p_data(operation, prime, training_fraction)\n    train_dataset = GroupDataset(dataset, \"train\")\n    val_dataset = GroupDataset(dataset, \"val\")\n    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size)\n    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size)\n    return (\n        train_loader,\n        val_loader,\n        train_dataset.dataset.n_vocab,\n        train_dataset.dataset.n_out,\n    )\n\n\nclass DecoderBlock(torch.nn.Module):\n    def __init__(self, dim_model: int, n_heads: int):\n        super().__init__()\n\n        self.self_attn = nn.MultiheadAttention(dim_model, n_heads)\n        self.self_attn_norm = nn.LayerNorm(dim_model)\n        self.ffn = nn.Sequential(\n            nn.Linear(dim_model, dim_model * 4),\n            nn.GELU(),\n            nn.Linear(dim_model * 4, dim_model),\n        )\n        self.ffn_norm = nn.LayerNorm(dim_model)\n\n    def forward(self, x: Tensor):\n        attn_mask = torch.full(\n            (len(x), len(x)), -float(\"Inf\"), device=x.device, dtype=x.dtype\n        )\n        attn_mask = torch.triu(attn_mask, diagonal=1)\n\n        a1, _ = self.self_attn(x, x, x, attn_mask=attn_mask)\n        a1 = self.self_attn_norm(x + a1)\n        a2 = self.ffn(a1)\n        a2 = self.ffn_norm(a1 + a2)\n\n        return a2\n\n\nclass Transformer(torch.nn.Module):\n    def __init__(\n            self,\n            num_layers: int,\n            dim_model: int,\n            num_heads: int,\n            vocab_size: int,\n            output_size: int,\n            seq_len: int,\n    ):\n        super().__init__()\n\n        self.token_embeddings = nn.Embedding(vocab_size, dim_model)\n        self.position_embeddings = nn.Embedding(seq_len, dim_model)\n        self.model = nn.Sequential(\n            *[DecoderBlock(dim_model, num_heads) for _ in range(num_layers)],\n            nn.LayerNorm(dim_model),\n            nn.Linear(dim_model, output_size),\n        )\n\n    def forward(self, inputs: Tensor):\n        batch_size, context_len = inputs.shape\n\n        token_embedding = self.token_embeddings(inputs)\n\n        positions = repeat(\n            torch.arange(context_len, device=inputs.device), \"p -> b p\", b=batch_size\n        )\n        position_embedding = self.position_embeddings(positions)\n\n        embedding = token_embedding + position_embedding\n\n        embedding = rearrange(embedding, \"b s d -> s b d\")\n\n        return self.model(embedding)\n\n\ndef train(model, train_loader, optimizer, scheduler, device, num_train_batches):\n    # Set model to training mode\n    model.train()\n    criterion = torch.nn.CrossEntropyLoss()\n    loss_total, correct = 0.0, 0.0\n    total = 0\n\n    # Loop over each batch from the training set\n    count = 0\n    for batch in train_loader:\n        count += 1\n        # Copy data to device if needed\n        batch = tuple(t.to(device) for t in batch)\n\n        # Unpack the batch from the loader\n        inputs, labels = batch\n\n        # Zero gradient buffers\n        optimizer.zero_grad()\n\n        # Forward pass\n        output = model(inputs)[-1, :, :]\n        loss = criterion(output, labels)\n        correct += (torch.argmax(output, dim=1) == labels).sum()\n        loss_total += loss * len(labels)\n        total += len(labels)\n        # Backward pass\n        loss.backward()\n\n        # Update weights\n        optimizer.step()\n        scheduler.step()\n        if count >= num_train_batches:\n            break\n\n    acc = correct / total\n    loss = loss_total / total\n\n    metrics = {\n        \"train_accuracy\": float(acc),\n        \"train_loss\": float(loss),\n    }\n    return metrics\n\n\ndef evaluate(model, val_loader, device, num_eval_batches):\n    # Set model to evaluation mode\n    model.eval()\n    criterion = torch.nn.CrossEntropyLoss()\n\n    correct = 0\n    loss = 0.0\n    total = 0\n    count = 0\n    # Loop over each batch from the validation set\n    for batch in val_loader:\n\n        # Copy data to device if needed\n        batch = tuple(t.to(device) for t in batch)\n\n        # Unpack the batch from the loader\n        inputs, labels = batch\n\n        # Forward pass\n        with torch.no_grad():\n            output = model(inputs)[-1, :, :]\n            correct += (torch.argmax(output, dim=1) == labels).sum()\n            loss += criterion(output, labels) * len(labels)\n            total += labels.shape[0]\n        count += 1\n        if count >= num_eval_batches:\n            break\n\n    acc = correct / total\n    loss = loss / total\n\n    metrics = {\"val_accuracy\": float(acc), \"val_loss\": float(loss)}\n    return metrics\n\n\ndef run(out_dir, dataset, seed_offset):\n    os.makedirs(out_dir, exist_ok=True)\n    device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n    torch.manual_seed(1337 + seed_offset)\n    train_loader, val_loader, n_vocab, n_output = get_data(\n        operation=dataset,\n        prime=97,\n        training_fraction=0.5,\n        batch_size=512,\n    )\n\n    model = Transformer(\n        num_layers=2,\n        dim_model=128,\n        num_heads=4,\n        vocab_size=n_vocab,\n        output_size=n_output,\n        seq_len=5,\n    ).to(device)\n\n    optimizer = torch.optim.AdamW(\n        model.parameters(),\n        lr=1e-3,\n        betas=(0.9, 0.98),\n        weight_decay=0.5,\n    )\n    num_train_batches = 10\n    num_eval_batches = 8\n    num_total_updates = 7500\n    warmup_steps = 50\n    scheduler = torch.optim.lr_scheduler.LambdaLR(\n        optimizer, lr_lambda=lambda s: min(s / warmup_steps, 1)\n    )\n\n    final_info, train_log_info, val_log_info = [], [], []\n    step_val_acc_99 = num_total_updates\n    for ep in range(num_total_updates // num_train_batches):\n        train_metrics = train(\n            model,\n            train_loader,\n            optimizer,\n            scheduler,\n            device,\n            num_train_batches,\n        )\n        val_metrics = evaluate(\n            model,\n            val_loader,\n            device,\n            num_eval_batches,\n        )\n        train_metrics[\"step\"] = (ep + 1) * num_train_batches\n        val_metrics[\"step\"] = (ep + 1) * num_train_batches\n\n        if step_val_acc_99 == num_total_updates and val_metrics[\"val_accuracy\"] > 0.99:\n            step_val_acc_99 = val_metrics[\"step\"]\n        train_log_info.append(train_metrics)\n        val_log_info.append(val_metrics)\n\n    final_info = {\n        \"final_train_loss\": train_metrics[\"train_loss\"],\n        \"final_val_loss\": val_metrics[\"val_loss\"],\n        \"final_train_acc\": train_metrics[\"train_accuracy\"],\n        \"final_val_acc\": val_metrics[\"val_accuracy\"],\n        \"step_val_acc_99\": step_val_acc_99,\n    }\n    print(final_info)\n    with open(\n            os.path.join(out_dir, f\"final_info_{dataset}_{seed_offset}.json\"), \"w\"\n    ) as f:\n        json.dump(final_info, f)\n    return final_info, train_log_info, val_log_info\n\n\nparser = argparse.ArgumentParser(description=\"Run experiment\")\nparser.add_argument(\"--out_dir\", type=str, default=\"run_0\", help=\"Output directory\")\nargs = parser.parse_args()\n\nif __name__ == \"__main__\":\n    num_seeds = {\n        \"x_div_y\": 3,\n        \"x_plus_y\": 3,\n        \"x_minus_y\": 3,\n        \"permutation\": 3,\n    }\n\n    out_dir = args.out_dir\n    all_results = {}\n    final_infos = {}\n    for dataset in [\"x_div_y\", \"x_minus_y\", \"x_plus_y\", \"permutation\"]:\n        final_info_list = []\n        for seed_offset in range(num_seeds[dataset]):\n            print(f\"Running {dataset} with seed offset {seed_offset}\")\n            final_info, train_info, val_info = run(args.out_dir, dataset, seed_offset)\n            all_results[f\"{dataset}_{seed_offset}_final_info\"] = final_info\n            all_results[f\"{dataset}_{seed_offset}_train_info\"] = train_info\n            all_results[f\"{dataset}_{seed_offset}_val_info\"] = val_info\n            final_info_list.append(final_info)\n        final_info_dict = {\n            k: [d[k] for d in final_info_list] for k in final_info_list[0].keys()\n        }\n        means = {f\"{k}_mean\": np.mean(v) for k, v in final_info_dict.items()}\n        stderrs = {\n            f\"{k}_stderr\": np.std(v) / len(v) for k, v in final_info_dict.items()\n        }\n        final_infos[dataset] = {\n            \"means\": means,\n            \"stderrs\": stderrs,\n            \"final_info_dict\": final_info_dict,\n        }\n\n    with open(os.path.join(out_dir, \"final_info.json\"), \"w\") as f:\n        json.dump(final_infos, f)\n\n    with open(os.path.join(out_dir, \"all_results.npy\"), \"wb\") as f:\n        np.save(f, all_results)\n",
+        "seed_ideas": [
+          {
+            "name": "batch_size_grokking",
+            "title": "Batch Size Grokking: Assessing the impact of the training batchsize on the grokking phenomenon",
+            "experiment": "grokking",
+            "interestingness": 6,
+            "feasibility": 4,
+            "novelty": 4
+          },
+          {
+            "name": "model_architecture_grokking",
+            "title": "Impact of Transformer Architecture on Grokking Behavior",
+            "experiment": "grokking",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 7
+          },
+          {
+            "name": "cyclic_lr_grokking",
+            "title": "Cyclic Learning Rates and Gradient Dynamics in Grokking",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "initialization_impact_grokking",
+            "title": "Structured vs. Random Initialization: Effects on Grokking Dynamics",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "task_complexity_grokking",
+            "title": "Grokking Dynamics Across Task Complexity: From Simple to Compound Operations",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 6,
+            "novelty": 8
+          },
+          {
+            "name": "data_imbalance_grokking",
+            "title": "Impact of Data Imbalance on Grokking Dynamics",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "scheduled_regularization_grokking",
+            "title": "Scheduled Regularization: A Dynamic Approach to Enhance Grokking",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "attention_grokking_analysis",
+            "title": "Quantifying Attention Shifts During Grokking",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "input_encoding_grokking",
+            "title": "Impact of Input Encodings on Grokking Dynamics in Mathematical Operations",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 6,
+            "novelty": 8
+          },
+          {
+            "name": "loss_landscape_grokking",
+            "title": "Quantifying Loss Landscape Evolution During Grokking",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "optimizer_impact_grokking",
+            "title": "Optimizer Impact on Grokking Dynamics: SGD vs Adam",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "data_augmentation_grokking",
+            "title": "Impact of Data Augmentation on Grokking Dynamics in Mathematical Operations",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "hidden_representation_evolution",
+            "title": "Tracking the Evolution of Hidden Representations During Grokking",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "mutual_information_grokking",
+            "title": "Mutual Information Dynamics During Grokking: Quantifying Representation Changes",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "curriculum_learning_grokking",
+            "title": "Curriculum Learning's Impact on Grokking Dynamics in Mathematical Operations",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "robustness_grokking_correlation",
+            "title": "Correlating Grokking with Input Robustness in Mathematical Operations",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "noisy_grokking",
+            "title": "Grokking Under Noise: Effects of Input Perturbations on Learning Dynamics and Robustness",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "grokking_extrapolation",
+            "title": "Grokking and Extrapolation: Assessing Out-of-Distribution Generalization in Mathematical Operations",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "pruning_grokking_dynamics",
+            "title": "Pruning and Grokking: Investigating the Impact of Sparsity on Generalization Dynamics",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "perturbation_robustness_grokking",
+            "title": "Grokking and Input Robustness: Exploring the Connection Between Generalization and Resilience to Perturbations",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "adversarial_robustness_grokking",
+            "title": "Grokking and Adversarial Robustness: Investigating the Relationship Between Sudden Generalization and Resilience to Adversarial Attacks",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 7,
+            "novelty": 9
+          },
+          {
+            "name": "mdl_grokking_correlation",
+            "title": "Minimal Description Length and Grokking: An Information-Theoretic Perspective on Sudden Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "critical_period_grokking",
+            "title": "Critical Learning Periods in Grokking: Investigating Component-Specific Freezing on Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "lottery_ticket_grokking",
+            "title": "Lottery Tickets in Grokking: Uncovering Sparse Subnetworks During Sudden Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "invariance_learning_grokking",
+            "title": "Invariance Learning in Grokking: Tracking Symmetry Awareness During Sudden Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "multi_task_grokking",
+            "title": "Multi-Task Learning and Grokking: Investigating Cross-Task Influences on Sudden Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "gradient_flow_grokking",
+            "title": "Gradient Flow Analysis During Grokking: Uncovering Internal Dynamics of Sudden Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "information_bottleneck_grokking",
+            "title": "Information Bottlenecks and Grokking: Exploring the Role of Information Compression in Sudden Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "calibration_grokking_dynamics",
+            "title": "Calibration Dynamics During Grokking: Exploring Probability Estimation in Sudden Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "positional_encoding_grokking",
+            "title": "Impact of Positional Encoding Schemes on Grokking Dynamics",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "gradient_accumulation_grokking",
+            "title": "Impact of Gradient Accumulation on Grokking Dynamics and Computational Efficiency",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "neural_collapse_grokking",
+            "title": "Neural Collapse and Grokking: Investigating Feature Convergence During Sudden Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 6,
+            "novelty": 9
+          },
+          {
+            "name": "hidden_state_clustering_grokking",
+            "title": "Evolution of Hidden State Clusters During Grokking: A Window into Neural Network Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "double_descent_grokking",
+            "title": "Double Descent and Grokking: Exploring the Interplay Between Model Depth and Sudden Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "attention_evolution_grokking",
+            "title": "Evolution of Attention Patterns During Grokking: Unveiling the Mechanisms of Sudden Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "critical_learning_periods_grokking",
+            "title": "Critical Learning Periods in Grokking: Temporal Dynamics of Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "emergent_modularity_grokking",
+            "title": "Emergent Modularity During Grokking: Analyzing Functional Specialization in Transformer Networks",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "grokking_trigger_samples",
+            "title": "Grokking Trigger Samples: Identifying Key Data Points in Sudden Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "effective_capacity_grokking",
+            "title": "Effective Capacity Dynamics During Grokking: Unraveling the Utilization of Model Parameters",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "critical_samples_grokking",
+            "title": "Critical Samples in Grokking: Identifying Key Data Points that Trigger Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "relational_complexity_grokking",
+            "title": "Impact of Input Relational Complexity on Grokking Dynamics",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "simplicity_bias_grokking",
+            "title": "Simplicity Bias in Grokking: Analyzing Function Complexity Evolution During Sudden Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "proto_lottery_tickets_grokking",
+            "title": "Evolution of Proto-Lottery Tickets During Grokking: Tracking Emergent Subnetworks in Sudden Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "positional_bias_grokking",
+            "title": "Impact of Positional Inductive Biases on Grokking Dynamics in Transformers",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "curriculum_grokking",
+            "title": "Curriculum Learning in Grokking: Optimizing Operation Sequences for Efficient Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "mutual_information_grokking",
+            "title": "Mutual Information Dynamics During Grokking: Tracking Information Flow in Key Network Layers",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "loss_landscape_curvature_grokking",
+            "title": "Loss Landscape Curvature Evolution During Grokking: Geometric Insights into Sudden Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "adaptive_grokking_critical_periods",
+            "title": "Adaptive Discovery of Critical Learning Periods in Grokking",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 9,
+            "novelty": 9
+          },
+          {
+            "name": "adversarial_robustness_evolution_grokking",
+            "title": "Evolution of Adversarial Robustness During Grokking: Linking Sudden Generalization with Model Robustness",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 9,
+            "novelty": 9
+          },
+          {
+            "name": "adaptive_memory_dynamics_grokking",
+            "title": "Adaptive Memory Dynamics During Grokking: Tracking Forgetting Patterns in Relation to Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 9,
+            "novelty": 9
+          },
+          {
+            "name": "noisy_grokking",
+            "title": "Grokking Under Noise: Investigating the Impact of Input Perturbations on Sudden Generalization",
+            "experiment": "grokking",
+            "interestingness": 9,
+            "feasibility": 9,
+            "novelty": 9
+          }
+        ]
+      }
+    },
+    {
+      "id": "hardly_newly_strong_frog",
+      "experiment": {
+        "name": "2d_diffusion",
+        "task_description": "You are given the following file to work with, that trains a low-dimensional diffusion model on 4 different 2D datasets. The diffusion model is based on DDPM. Particularly interesting ideas would involve controllable generation, e.g. biased towards different modes of the data, or new encodings for low-dimensional data aside from sinusoidal encodings.",
+        "init_code": "# This file trains a DDPM diffusion model on 2D datasets.\n\nimport argparse\nimport json\nimport os.path as osp\nimport pathlib\nimport pickle\nimport time\n\nimport npeet.entropy_estimators as ee\nimport numpy as np\nimport torch\nfrom torch import nn\nfrom torch.nn import functional as F\nfrom torch.optim.lr_scheduler import CosineAnnealingLR\nfrom torch.utils.data import DataLoader\nfrom tqdm.auto import tqdm\n\nimport datasets\nfrom ema_pytorch import EMA\n\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n\n\nclass SinusoidalEmbedding(nn.Module):\n    def __init__(self, dim: int, scale: float = 1.0):\n        super().__init__()\n        self.dim = dim\n        self.scale = scale\n\n    def forward(self, x: torch.Tensor):\n        x = x * self.scale\n        half_dim = self.dim // 2\n        emb = torch.log(torch.Tensor([10000.0])) / (half_dim - 1)\n        emb = torch.exp(-emb * torch.arange(half_dim)).to(device)\n        emb = x.unsqueeze(-1) * emb.unsqueeze(0)\n        emb = torch.cat((torch.sin(emb), torch.cos(emb)), dim=-1)\n        return emb\n\n\nclass ResidualBlock(nn.Module):\n    def __init__(self, width: int):\n        super().__init__()\n        self.ff = nn.Linear(width, width)\n        self.act = nn.ReLU()\n\n    def forward(self, x: torch.Tensor):\n        return x + self.ff(self.act(x))\n\n\nclass MLPDenoiser(nn.Module):\n    def __init__(\n            self,\n            embedding_dim: int = 128,\n            hidden_dim: int = 256,\n            hidden_layers: int = 3,\n    ):\n        super().__init__()\n        self.time_mlp = SinusoidalEmbedding(embedding_dim)\n        # sinusoidal embeddings help capture high-frequency patterns for low-dim data\n        self.input_mlp1 = SinusoidalEmbedding(embedding_dim, scale=25.0)\n        self.input_mlp2 = SinusoidalEmbedding(embedding_dim, scale=25.0)\n\n        self.network = nn.Sequential(\n            nn.Linear(embedding_dim * 3, hidden_dim),\n            *[ResidualBlock(hidden_dim) for _ in range(hidden_layers)],\n            nn.ReLU(),\n            nn.Linear(hidden_dim, 2),\n        )\n\n    def forward(self, x, t):\n        x1_emb = self.input_mlp1(x[:, 0])\n        x2_emb = self.input_mlp2(x[:, 1])\n        t_emb = self.time_mlp(t)\n        emb = torch.cat([x1_emb, x2_emb, t_emb], dim=-1)\n        return self.network(emb)\n\n\nclass NoiseScheduler():\n    def __init__(\n            self,\n            num_timesteps=1000,\n            beta_start=0.0001,\n            beta_end=0.02,\n            beta_schedule=\"linear\",\n    ):\n        self.num_timesteps = num_timesteps\n        if beta_schedule == \"linear\":\n            self.betas = torch.linspace(\n                beta_start, beta_end, num_timesteps, dtype=torch.float32).to(device)\n        elif beta_schedule == \"quadratic\":\n            self.betas = (torch.linspace(\n                beta_start ** 0.5, beta_end ** 0.5, num_timesteps, dtype=torch.float32) ** 2).to(device)\n        else:\n            raise ValueError(f\"Unknown beta schedule: {beta_schedule}\")\n\n        self.alphas = 1.0 - self.betas\n        self.alphas_cumprod = torch.cumprod(self.alphas, axis=0).to(device)\n        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.).to(device)\n\n        # required for self.add_noise\n        self.sqrt_alphas_cumprod = (self.alphas_cumprod ** 0.5).to(device)\n        self.sqrt_one_minus_alphas_cumprod = ((1 - self.alphas_cumprod) ** 0.5).to(device)\n\n        # required for reconstruct_x0\n        self.sqrt_inv_alphas_cumprod = torch.sqrt(1 / self.alphas_cumprod).to(device)\n        self.sqrt_inv_alphas_cumprod_minus_one = torch.sqrt(\n            1 / self.alphas_cumprod - 1).to(device)\n\n        # required for q_posterior\n        self.posterior_mean_coef1 = self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1. - self.alphas_cumprod).to(\n            device)\n        self.posterior_mean_coef2 = ((1. - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (\n                1. - self.alphas_cumprod)).to(device)\n\n    def reconstruct_x0(self, x_t, t, noise):\n        s1 = self.sqrt_inv_alphas_cumprod[t]\n        s2 = self.sqrt_inv_alphas_cumprod_minus_one[t]\n        s1 = s1.reshape(-1, 1)\n        s2 = s2.reshape(-1, 1)\n        return s1 * x_t - s2 * noise\n\n    def q_posterior(self, x_0, x_t, t):\n        s1 = self.posterior_mean_coef1[t]\n        s2 = self.posterior_mean_coef2[t]\n        s1 = s1.reshape(-1, 1)\n        s2 = s2.reshape(-1, 1)\n        mu = s1 * x_0 + s2 * x_t\n        return mu\n\n    def get_variance(self, t):\n        if t == 0:\n            return 0\n\n        variance = self.betas[t] * (1. - self.alphas_cumprod_prev[t]) / (1. - self.alphas_cumprod[t])\n        variance = variance.clip(1e-20)\n        return variance\n\n    def step(self, model_output, timestep, sample):\n        t = timestep\n        pred_original_sample = self.reconstruct_x0(sample, t, model_output)\n        pred_prev_sample = self.q_posterior(pred_original_sample, sample, t)\n\n        variance = 0\n        if t > 0:\n            noise = torch.randn_like(model_output)\n            variance = (self.get_variance(t) ** 0.5) * noise\n\n        pred_prev_sample = pred_prev_sample + variance\n\n        return pred_prev_sample\n\n    def add_noise(self, x_start, x_noise, timesteps):\n        s1 = self.sqrt_alphas_cumprod[timesteps]\n        s2 = self.sqrt_one_minus_alphas_cumprod[timesteps]\n\n        s1 = s1.reshape(-1, 1)\n        s2 = s2.reshape(-1, 1)\n\n        return s1 * x_start + s2 * x_noise\n\n    def __len__(self):\n        return self.num_timesteps\n\n\nif __name__ == \"__main__\":\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"--train_batch_size\", type=int, default=256)\n    parser.add_argument(\"--eval_batch_size\", type=int, default=10000)\n    parser.add_argument(\"--learning_rate\", type=float, default=3e-4)\n    parser.add_argument(\"--num_timesteps\", type=int, default=100)\n    parser.add_argument(\"--num_train_steps\", type=int, default=10000)\n    parser.add_argument(\"--beta_schedule\", type=str, default=\"linear\", choices=[\"linear\", \"quadratic\"])\n    parser.add_argument(\"--embedding_dim\", type=int, default=128)\n    parser.add_argument(\"--hidden_size\", type=int, default=256)\n    parser.add_argument(\"--hidden_layers\", type=int, default=3)\n    parser.add_argument(\"--out_dir\", type=str, default=\"run_0\")\n    config = parser.parse_args()\n\n    final_infos = {}\n    all_results = {}\n\n    pathlib.Path(config.out_dir).mkdir(parents=True, exist_ok=True)\n\n    for dataset_name in [\"circle\", \"dino\", \"line\", \"moons\"]:\n        dataset = datasets.get_dataset(dataset_name, n=100000)\n        dataloader = DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True)\n\n        model = MLPDenoiser(\n            embedding_dim=config.embedding_dim,\n            hidden_dim=config.hidden_size,\n            hidden_layers=config.hidden_layers,\n        ).to(device)\n        ema_model = EMA(model, beta=0.995, update_every=10).to(device)\n\n        noise_scheduler = NoiseScheduler(num_timesteps=config.num_timesteps, beta_schedule=config.beta_schedule)\n\n        optimizer = torch.optim.AdamW(\n            model.parameters(),\n            lr=config.learning_rate,\n        )\n        scheduler = CosineAnnealingLR(optimizer, T_max=config.num_train_steps)\n        train_losses = []\n        print(\"Training model...\")\n\n        model.train()\n        global_step = 0\n        progress_bar = tqdm(total=config.num_train_steps, mininterval=10, disable=True)\n        progress_bar.set_description(\"Training\")\n\n        start_time = time.time()\n        while global_step < config.num_train_steps:\n            for batch in dataloader:\n                if global_step >= config.num_train_steps:\n                    break\n                batch = batch[0].to(device)\n                noise = torch.randn(batch.shape).to(device)\n                timesteps = torch.randint(\n                    0, noise_scheduler.num_timesteps, (batch.shape[0],)\n                ).long().to(device)\n\n                noisy = noise_scheduler.add_noise(batch, noise, timesteps)\n                noise_pred = model(noisy, timesteps)\n                loss = F.mse_loss(noise_pred, noise)\n                loss.backward()\n\n                nn.utils.clip_grad_norm_(model.parameters(), 0.5)\n                optimizer.step()\n                optimizer.zero_grad()\n                ema_model.update()\n\n                scheduler.step()\n                progress_bar.update(1)\n                logs = {\"loss\": loss.detach().item()}\n                train_losses.append(loss.detach().item())\n                progress_bar.set_postfix(**logs)\n                global_step += 1\n\n        progress_bar.close()\n        end_time = time.time()\n        training_time = end_time - start_time\n\n        # Eval loss\n        model.eval()\n        eval_losses = []\n        for batch in dataloader:\n            batch = batch[0].to(device)\n            noise = torch.randn(batch.shape).to(device)\n            timesteps = torch.randint(\n                0, noise_scheduler.num_timesteps, (batch.shape[0],)\n            ).long().to(device)\n            noisy = noise_scheduler.add_noise(batch, noise, timesteps)\n            noise_pred = model(noisy, timesteps)\n            loss = F.mse_loss(noise_pred, noise)\n            eval_losses.append(loss.detach().item())\n        eval_loss = np.mean(eval_losses)\n\n        # Eval image saving\n        ema_model.eval()\n        sample = torch.randn(config.eval_batch_size, 2).to(device)\n        timesteps = list(range(len(noise_scheduler)))[::-1]\n        inference_start_time = time.time()\n        for t in timesteps:\n            t = torch.from_numpy(np.repeat(t, config.eval_batch_size)).long().to(device)\n            with torch.no_grad():\n                residual = ema_model(sample, t)\n            sample = noise_scheduler.step(residual, t[0], sample)\n        sample = sample.cpu().numpy()\n        inference_end_time = time.time()\n        inference_time = inference_end_time - inference_start_time\n\n        # Eval estimated KL\n        real_data = dataset.tensors[0].numpy()\n        kl_divergence = ee.kldiv(real_data, sample, k=5)\n\n        final_infos[dataset_name] = {\n            \"means\": {\n                \"training_time\": training_time,\n                \"eval_loss\": eval_loss,\n                \"inference_time\": inference_time,\n                \"kl_divergence\": kl_divergence,\n            }\n        }\n\n        all_results[dataset_name] = {\n            \"train_losses\": train_losses,\n            \"images\": sample,\n        }\n\n    with open(osp.join(config.out_dir, \"final_info.json\"), \"w\") as f:\n        json.dump(final_infos, f)\n\n    with open(osp.join(config.out_dir, \"all_results.pkl\"), \"wb\") as f:\n        pickle.dump(all_results, f)\n",
+        "seed_ideas": [
+          {
+            "name": "learning_rate_schedule",
+            "title": "Adaptive Learning Rate Schedules: Comparing different learning rate schedules for diffusion models.",
+            "experiment": "2d_diffusion",
+            "interestingness": 4,
+            "feasibility": 10,
+            "novelty": 3
+          },
+          {
+            "name": "hybrid_embedding",
+            "title": "Exploring Hybrid Embedding Methods for Improved Diffusion Model Performance",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 7
+          },
+          {
+            "name": "region_specific_diffusion",
+            "title": "Region-Specific Diffusion Models: Controlling Generation to Target Specific Regions",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "mode_specific_diffusion",
+            "title": "Mode-Specific Diffusion Models: Unsupervised Mode Discovery and Generation",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "resolution_conditioned_diffusion",
+            "title": "Resolution-Conditioned Diffusion Models: Generating Samples at Different Resolutions",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "geometric_constraints",
+            "title": "Geometric Constraints for Diffusion Models: Improving Sample Quality",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 7
+          },
+          {
+            "name": "targeted_diffusion_model_pruning",
+            "title": "Targeted Diffusion Model Pruning: Simplifying Specific Components for Efficient Generation",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 7
+          },
+          {
+            "name": "noise_schedule_adaptation",
+            "title": "Adaptive Noise Schedule for Improved Sample Diversity",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "dataset_agnostic_diffusion",
+            "title": "Dataset-Agnostic Diffusion Models: Adapting to New Datasets through Fine-Tuning",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "diffusion_trajectory_control",
+            "title": "Diffusion Trajectory Control in Diffusion Models: Improving Sample Quality and Diversity",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "diffusion_mode_fingerprinting",
+            "title": "Diffusion Mode Fingerprinting: Analyzing the Mode Coverage of Diffusion Models",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "mode_transition",
+            "title": "Evaluating Mode Transition in Diffusion Models",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "efficient_learnable_noise_schedule",
+            "title": "Efficient Learnable Noise Schedules for Diffusion Models: Improving Sample Quality and Diversity",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "quantile_calibration_diffusion",
+            "title": "Quantile Calibration for Diffusion Models",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 7
+          },
+          {
+            "name": "diffusion_experts",
+            "title": "Diffusion Experts: A Single Model with Multiple Specialists for Improved Mode Coverage",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "mode_signatures",
+            "title": "Mode Signatures: Characterizing the Unique Behaviors of Diffusion Models",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "diffusion_model_ensembling",
+            "title": "Diffusion Model Ensembling: Combining Pre-Trained Models with Different Hyperparameters",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "diffusion_confidence",
+            "title": "Diffusion Model Confidence: Predicting Sample Quality with Confidence Scores",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "graph_aware_diffusion",
+            "title": "Graph-Aware Diffusion Models: Regularizing Generative Models with Graph-Based Methods",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "diffusion_internal_analysis",
+            "title": "Diffusion Model Internal Analysis: Uncovering Biases through Embedding Space Exploration",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "temporal_conditioning",
+            "title": "Temporal Conditioning in Diffusion Models: Controlling Generation with Temporal Context",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "diffusion_bottlenecks",
+            "title": "Diffusion Pathway Bottlenecks: Identifying and Debottlenecking Critical Points in Noise Schedules",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "mode_transitioning_loss",
+            "title": "Improving Mode Transitioning in Diffusion Models through Loss Function Design",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "diffusion_model_analysis",
+            "title": "Diffusion Model Analysis: Leveraging Evaluation Metrics and Visualization Tools",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "symmetry_invariant_loss",
+            "title": "Symmetry-Invariant Loss Functions for Regularizing Diffusion Models",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "dataset_distribution_fingerprinting",
+            "title": "Dataset Distribution Fingerprinting using Diffusion Models",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "diffusion_perturbations",
+            "title": "Diffusion Perturbations: Targeted Modifications to the Noise Schedule for Improved Performance and Control",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "diffusion_trajectory_event_segmentation",
+            "title": "Diffusion Trajectory Event Segmentation: Uncovering Key Milestones in the Diffusion Process",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 9
+          },
+          {
+            "name": "noise_schedule_signatures",
+            "title": "Noise Schedule Signatures: Unique Patterns in Diffusion Processes",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "diffusion_model_introspection",
+            "title": "Diffusion Model Introspection: Enabling Self-Awareness in Generative Models",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 7,
+            "novelty": 8
+          },
+          {
+            "name": "task_agnostic_diffusion",
+            "title": "Task-Agnostic Diffusion Models: Adapting to New Tasks with Minimal Training Data",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "diffusion_ensembles",
+            "title": "Diffusion Ensembles: Combining Multiple Models for Improved Generative Performance",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "noise_schedule_symmetry",
+            "title": "Noise Schedule Symmetry: Understanding its Effects on Diffusion Processes",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "diffusion_model_temporal_adaptation",
+            "title": "Investigating Diffusion Model Temporal Adaptation: Adapting to Changes in Data Distribution over Time",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "adaptive_noise_schedule",
+            "title": "Adaptive Noise Schedules for Improved Diffusion Model Performance",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 7
+          },
+          {
+            "name": "diffusion_model_robustness_to_additive_noise",
+            "title": "Diffusion Model Robustness to Additive Noise: Evaluating and Improving Model Performance",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "diversity_regularized_loss",
+            "title": "Diversity-Regularized Loss Function for Encouraging Sample Diversity",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "noise_schedule_interpolation",
+            "title": "Noise Schedule Interpolation for Improved Sample Diversity",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "curriculum_diffusion",
+            "title": "Curriculum Learning for Diffusion Models: A Simple Approach to Difficulty-Aware Training",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "diffusion_model_masking",
+            "title": "Diffusion Model Masking: A Novel Approach to Generating Diverse and Novel Samples",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "noise_schedule_correlations",
+            "title": "Uncovering Correlations between Noise Schedules and Generated Samples",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "diffusion_fingerprints",
+            "title": "Diffusion Fingerprints: Extracting Unique Patterns from Noise Schedules and Model Internal States",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "diffusion_model_forgetting",
+            "title": "Diffusion Model Forgetting: A Novel Approach to Controllable and Diverse Generation",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "diffusion_trajectory_quality",
+            "title": "Diffusion Trajectory Analysis: Identifying Patterns in Noise Schedules for High-Quality Samples",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "dataset_fingerprinting",
+            "title": "Dataset Fingerprinting in Diffusion Models: A Simple Approach to Dataset Identification",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 9,
+            "novelty": 9
+          },
+          {
+            "name": "diffusion_confidence_estimation",
+            "title": "Confidence Estimation in Diffusion Models: A Comparative Study",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 7
+          },
+          {
+            "name": "noise_schedule_perturbation",
+            "title": "Perturbing the Noise Schedule: Analyzing the Model's Response to Changes in the Input",
+            "experiment": "2d_diffusion",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "noise_schedule_chunking",
+            "title": "Noise Schedule Chunking: Learning to Focus on Relevant Noise Schedule Chunks",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "continuity_loss",
+            "title": "Continuity Loss in Diffusion Models: Improving Temporal Coherence",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "noise_schedule_analysis",
+            "title": "Uncovering the Relationship between Noise Schedules, Generated Samples, and Mode Coverage in Diffusion Models",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "pretrained_noise_schedule_fine_tuning",
+            "title": "Fine-Tuning Pre-Trained Models with Adaptive Noise Schedules for Fast Adaptation to New Datasets",
+            "experiment": "2d_diffusion",
+            "interestingness": 9,
+            "feasibility": 9,
+            "novelty": 8
+          }
+        ]
+      }
+    },
+    {
+      "id": "widely_gently_fancy_mako",
+      "experiment": {
+        "name": "mobilenetV3",
+        "task_description": "You are given the following file to work with, which studies Convolutional neural networks by training multiple small models on multiple datasets. Please come up with interesting experiments to investigate the best architectures of small convolution networks.",
+        "init_code": "import argparse\nimport json\nimport os\nimport random\nimport time\nfrom dataclasses import dataclass\nfrom functools import partial\nfrom typing import Callable, List, Optional, Union, Tuple\n\nimport numpy as np\nimport torch\nimport torch.nn as nn\nimport torch.optim as optim\nfrom torch.utils.data import DataLoader\nfrom torchvision import datasets, transforms\n\n\n# _make_divisible function from torchvision\ndef _make_divisible(v: float, divisor: int, min_value: Optional[int] = None) -> int:\n    \"\"\"\n    This function ensures that all layers have a channel number that is divisible by 8.\n    \"\"\"\n    if min_value is None:\n        min_value = divisor\n    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)\n    # Make sure that rounding down does not go down by more than 10%.\n    if new_v < 0.9 * v:\n        new_v += divisor\n    return new_v\n\n\n# Squeeze-and-Excitation block\nclass SqueezeExcitation(nn.Module):\n    def __init__(\n            self,\n            input_channels: int,\n            squeeze_channels: int,\n            activation: Callable[..., nn.Module] = nn.ReLU,\n            scale_activation: Callable[..., nn.Module] = nn.Hardsigmoid,\n    ) -> None:\n        super().__init__()\n        self.avgpool = nn.AdaptiveAvgPool2d(1)\n        self.fc1 = nn.Conv2d(input_channels, squeeze_channels, 1)\n        self.fc2 = nn.Conv2d(squeeze_channels, input_channels, 1)\n        self.activation = activation(inplace=True)\n        self.scale_activation = scale_activation(inplace=True)\n\n    def _scale(self, input: torch.Tensor) -> torch.Tensor:\n        scale = self.avgpool(input)\n        scale = self.fc1(scale)\n        scale = self.activation(scale)\n        scale = self.fc2(scale)\n        scale = self.scale_activation(scale)\n        return scale\n\n    def forward(self, input: torch.Tensor) -> torch.Tensor:\n        scale = self._scale(input)\n        return input * scale\n\n\n# ConvNormActivation block\nclass ConvNormActivation(nn.Sequential):\n    def __init__(\n            self,\n            in_channels: int,\n            out_channels: int,\n            kernel_size: Union[int, Tuple[int]] = 3,\n            stride: Union[int, Tuple[int]] = 1,\n            padding: Optional[Union[int, Tuple[int], str]] = None,\n            groups: int = 1,\n            norm_layer: Optional[Callable[..., nn.Module]] = nn.BatchNorm2d,\n            activation_layer: Optional[Callable[..., nn.Module]] = nn.ReLU,\n            dilation: Union[int, Tuple[int]] = 1,\n            bias: Optional[bool] = None,\n    ) -> None:\n\n        if padding is None:\n            if isinstance(kernel_size, int):\n                padding = (kernel_size - 1) // 2 * dilation\n            else:\n                padding = tuple((k - 1) // 2 * d for k, d in zip(kernel_size, dilation))\n        if bias is None:\n            bias = norm_layer is None\n\n        layers = []\n        layers.append(\n            nn.Conv2d(\n                in_channels,\n                out_channels,\n                kernel_size,\n                stride,\n                padding,\n                dilation=dilation,\n                groups=groups,\n                bias=bias,\n            )\n        )\n\n        if norm_layer is not None:\n            layers.append(norm_layer(out_channels))\n        if activation_layer is not None:\n            layers.append(activation_layer(inplace=True))\n        super().__init__(*layers)\n        self.out_channels = out_channels\n\n\n# InvertedResidualConfig class\nclass InvertedResidualConfig:\n    def __init__(\n            self,\n            input_channels: int,\n            kernel: int,\n            expanded_channels: int,\n            out_channels: int,\n            use_se: bool,\n            activation: str,\n            stride: int,\n            dilation: int,\n            width_mult: float,\n    ):\n        self.input_channels = self.adjust_channels(input_channels, width_mult)\n        self.kernel = kernel\n        self.expanded_channels = self.adjust_channels(expanded_channels, width_mult)\n        self.out_channels = self.adjust_channels(out_channels, width_mult)\n        self.use_se = use_se\n        self.activation = activation\n        self.stride = stride\n        self.dilation = dilation\n\n    @staticmethod\n    def adjust_channels(channels: int, width_mult: float):\n        return _make_divisible(channels * width_mult, 8)\n\n\n# InvertedResidual block\nclass InvertedResidual(nn.Module):\n    def __init__(\n            self,\n            cnf: InvertedResidualConfig,\n            norm_layer: Callable[..., nn.Module],\n            se_layer: Callable[..., nn.Module] = partial(SqueezeExcitation, scale_activation=nn.Hardsigmoid),\n    ):\n        super().__init__()\n        if not (1 <= cnf.stride <= 2):\n            raise ValueError(\"Illegal stride value\")\n\n        self.use_res_connect = cnf.stride == 1 and cnf.input_channels == cnf.out_channels\n\n        layers: List[nn.Module] = []\n        activation_layer = nn.Hardswish if cnf.activation == \"HS\" else nn.ReLU\n\n        # Expand phase\n        if cnf.expanded_channels != cnf.input_channels:\n            layers.append(\n                ConvNormActivation(\n                    cnf.input_channels,\n                    cnf.expanded_channels,\n                    kernel_size=1,\n                    norm_layer=norm_layer,\n                    activation_layer=activation_layer,\n                )\n            )\n\n        # Depthwise convolution\n        layers.append(\n            ConvNormActivation(\n                cnf.expanded_channels,\n                cnf.expanded_channels,\n                kernel_size=cnf.kernel,\n                stride=cnf.stride,\n                groups=cnf.expanded_channels,\n                norm_layer=norm_layer,\n                activation_layer=activation_layer,\n                dilation=cnf.dilation,\n            )\n        )\n\n        # Squeeze-and-Excitation\n        if cnf.use_se:\n            squeeze_channels = _make_divisible(cnf.expanded_channels // 4, 8)\n            layers.append(\n                se_layer(\n                    cnf.expanded_channels,\n                    squeeze_channels,\n                    activation=nn.ReLU,\n                )\n            )\n\n        # Project phase\n        layers.append(\n            ConvNormActivation(\n                cnf.expanded_channels,\n                cnf.out_channels,\n                kernel_size=1,\n                norm_layer=norm_layer,\n                activation_layer=None,\n            )\n        )\n\n        self.block = nn.Sequential(*layers)\n        self.out_channels = cnf.out_channels\n        self.is_strided = cnf.stride > 1\n\n    def forward(self, input: torch.Tensor) -> torch.Tensor:\n        result = self.block(input)\n        if self.use_res_connect:\n            return input + result\n        else:\n            return result\n\n\n# MobileNetV3 Small model\nclass MobileNetV3Small(nn.Module):\n    def __init__(\n            self,\n            num_classes: int = 1000,\n            width_mult: float = 1.0,\n            dropout: float = 0.2,\n            reduced_tail: bool = False,\n            dilated: bool = False,\n            norm_layer: Optional[Callable[..., nn.Module]] = None,\n    ) -> None:\n        super().__init__()\n\n        if norm_layer is None:\n            norm_layer = partial(nn.BatchNorm2d, eps=0.001, momentum=0.01)\n\n        layers: List[nn.Module] = []\n\n        bneck_conf = partial(InvertedResidualConfig, width_mult=width_mult)\n\n        # Build inverted residual setting\n        reduce_divider = 2 if reduced_tail else 1\n        dilation = 2 if dilated else 1\n\n        inverted_residual_setting = [\n            # input_c, kernel, exp_c, out_c, se, nl, s, d\n            bneck_conf(16, 3, 16, 16, True, \"RE\", 2, 1),\n            bneck_conf(16, 3, 72, 24, False, \"RE\", 2, 1),\n            bneck_conf(24, 3, 88, 24, False, \"RE\", 1, 1),\n            bneck_conf(24, 5, 96, 40, True, \"HS\", 2, 1),\n            bneck_conf(40, 5, 240, 40, True, \"HS\", 1, 1),\n            bneck_conf(40, 5, 240, 40, True, \"HS\", 1, 1),\n            bneck_conf(40, 5, 120, 48, True, \"HS\", 1, 1),\n            bneck_conf(48, 5, 144, 48, True, \"HS\", 1, 1),\n            bneck_conf(48, 5, 288 // reduce_divider, 96 // reduce_divider, True, \"HS\", 2, dilation),\n            bneck_conf(96 // reduce_divider, 5, 576 // reduce_divider, 96 // reduce_divider, True, \"HS\", 1, dilation),\n            bneck_conf(96 // reduce_divider, 5, 576 // reduce_divider, 96 // reduce_divider, True, \"HS\", 1, dilation),\n        ]\n\n        last_channel = _make_divisible(1024 // reduce_divider * width_mult, 8)\n\n        # First layer\n        firstconv_output_channels = inverted_residual_setting[0].input_channels\n        layers.append(\n            ConvNormActivation(\n                3,\n                firstconv_output_channels,\n                kernel_size=3,\n                stride=2,\n                norm_layer=norm_layer,\n                activation_layer=nn.Hardswish,\n            )\n        )\n\n        # Building inverted residual blocks\n        for cnf in inverted_residual_setting:\n            layers.append(InvertedResidual(cnf, norm_layer))\n\n        # Building last several layers\n        lastconv_input_channels = inverted_residual_setting[-1].out_channels\n        lastconv_output_channels = _make_divisible(576 * width_mult, 8)\n        layers.append(\n            ConvNormActivation(\n                lastconv_input_channels,\n                lastconv_output_channels,\n                kernel_size=1,\n                norm_layer=norm_layer,\n                activation_layer=nn.Hardswish,\n            )\n        )\n\n        self.features = nn.Sequential(*layers)\n        self.avgpool = nn.AdaptiveAvgPool2d(1)\n        self.classifier = nn.Sequential(\n            nn.Linear(lastconv_output_channels, last_channel),\n            nn.Hardswish(inplace=True),\n            nn.Dropout(p=dropout, inplace=True),\n            nn.Linear(last_channel, num_classes),\n        )\n\n        # Initialize weights\n        self._initialize_weights()\n\n    def _initialize_weights(self):\n        for m in self.modules():\n            if isinstance(m, nn.Conv2d):\n                nn.init.kaiming_normal_(m.weight, mode=\"fan_out\")\n                if m.bias is not None:\n                    nn.init.zeros_(m.bias)\n            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm, nn.SyncBatchNorm)):\n                nn.init.ones_(m.weight)\n                nn.init.zeros_(m.bias)\n            elif isinstance(m, nn.Linear):\n                nn.init.normal_(m.weight, mean=0.0, std=0.01)\n                nn.init.zeros_(m.bias)\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        x = self.features(x)\n        x = self.avgpool(x)\n        x = torch.flatten(x, 1)\n        x = self.classifier(x)\n        return x\n\n\n# Function to create the model and load pretrained weights\ndef mobilenet_v3_small(pretrained=False, progress=True, **kwargs):\n    model = MobileNetV3Small(**kwargs)\n\n    if pretrained:\n        # Load the torchvision model with pretrained weights\n        from torchvision.models import mobilenet_v3_small as tv_mobilenet_v3_small\n        from torchvision.models import MobileNet_V3_Small_Weights\n\n        # Check for number of classes\n        if kwargs.get('num_classes', 1000) != 1000:\n            # We cannot load the classifier weights (different classes)\n            pretrained_model = tv_mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.DEFAULT, progress=progress)\n            pretrained_state_dict = pretrained_model.state_dict()\n            # Remove classifier weights\n            pretrained_state_dict = {k: v for k, v in pretrained_state_dict.items() if not k.startswith('classifier')}\n            model_dict = model.state_dict()\n            print(model_dict.keys())\n            # Update the model dict\n            model_dict.update(pretrained_state_dict)\n            model.load_state_dict(model_dict)\n        else:\n            # Load all weights\n            pretrained_model = tv_mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.DEFAULT, progress=progress)\n            model.load_state_dict(pretrained_model.state_dict())\n\n    return model\n\n\n@dataclass\nclass Config:\n    # data\n    data_path: str = './data'\n    dataset: str = 'cifar10'\n    num_classes: int = 10\n    # model\n    model: str = 'mobilenet_v3_small'\n    # training\n    batch_size: int = 128\n    learning_rate: float = 0.01\n    weight_decay: float = 1e-4\n    epochs: int = 2\n    # system\n    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'\n    num_workers: int = 2\n    # logging\n    log_interval: int = 100\n    eval_interval: int = 1000\n    # output\n    out_dir: str = 'run_0'\n    seed: int = 0\n    # compile for SPEED!\n    compile_model: bool = False\n\n\ndef get_data_loaders(config):\n    if config.dataset == 'cifar10':\n        transform_train = transforms.Compose([\n            transforms.RandomCrop(32, padding=4),\n            transforms.RandomHorizontalFlip(),\n            transforms.ToTensor(),\n            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),\n        ])\n\n        transform_test = transforms.Compose([\n            transforms.ToTensor(),\n            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),\n        ])\n\n        train_dataset = datasets.CIFAR10(root=config.data_path, train=True, download=True, transform=transform_train)\n        test_dataset = datasets.CIFAR10(root=config.data_path, train=False, download=True, transform=transform_test)\n    elif config.dataset == 'cifar100':\n        # Placeholder for CIFAR-100 (for future use)\n        transform_train = transforms.Compose([\n            transforms.RandomCrop(32, padding=4),\n            transforms.RandomHorizontalFlip(),\n            transforms.ToTensor(),\n            transforms.Normalize((0.5071, 0.4867, 0.4408),\n                                 (0.2675, 0.2565, 0.2761)),\n        ])\n\n        transform_test = transforms.Compose([\n            transforms.ToTensor(),\n            transforms.Normalize((0.5071, 0.4867, 0.4408),\n                                 (0.2675, 0.2565, 0.2761)),\n        ])\n\n        train_dataset = datasets.CIFAR100(root=config.data_path, train=True, download=True, transform=transform_train)\n        test_dataset = datasets.CIFAR100(root=config.data_path, train=False, download=True, transform=transform_test)\n        config.num_classes = 100  # Update number of classes for CIFAR-100\n    else:\n        raise ValueError(f\"Unknown dataset: {config.dataset}\")\n\n    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers)\n    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers)\n\n    return train_loader, test_loader\n\n\ndef train(config):\n    # Set random seeds\n    torch.manual_seed(config.seed)\n    np.random.seed(config.seed)\n    random.seed(config.seed)\n    if config.device == 'cuda':\n        torch.cuda.manual_seed_all(config.seed)\n\n    model = mobilenet_v3_small(pretrained=False, progress=True, num_classes=config.num_classes).to(config.device)\n\n    if config.compile_model:\n        print(\"Compiling the model...\")\n        model = torch.compile(model)\n\n    criterion = nn.CrossEntropyLoss()\n    optimizer = optim.SGD(model.parameters(), lr=config.learning_rate, momentum=0.9, weight_decay=config.weight_decay)\n    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)\n\n    train_loader, test_loader = get_data_loaders(config)\n\n    best_acc = 0.0\n    train_log_info = []\n    val_log_info = []\n\n    for epoch in range(config.epochs):\n        model.train()\n        train_loss = 0.0\n        train_correct = 0\n        train_total = 0\n\n        for batch_idx, (inputs, targets) in enumerate(train_loader):\n            inputs, targets = inputs.to(config.device), targets.to(config.device)\n\n            optimizer.zero_grad()\n            outputs = model(inputs)\n            loss = criterion(outputs, targets)\n            loss.backward()\n            optimizer.step()\n\n            train_loss += loss.item()\n            _, predicted = outputs.max(1)\n            train_total += targets.size(0)\n            train_correct += predicted.eq(targets).sum().item()\n\n            if batch_idx % config.log_interval == 0:\n                train_log_info.append({\n                    'epoch': epoch,\n                    'batch': batch_idx,\n                    'loss': train_loss / (batch_idx + 1),\n                    'acc': 100. * train_correct / train_total,\n                    'lr': optimizer.param_groups[0]['lr']\n                })\n                print(f'Epoch: {epoch}, Batch: {batch_idx}, Loss: {train_loss / (batch_idx + 1):.3f}, '\n                      f'Acc: {100. * train_correct / train_total:.3f}%, '\n                      f'LR: {optimizer.param_groups[0][\"lr\"]:.6f}')\n\n        val_loss, val_acc = evaluate(model, test_loader, criterion, config)\n        val_log_info.append({\n            'epoch': epoch,\n            'loss': val_loss,\n            'acc': val_acc\n        })\n        print(f'Validation - Loss: {val_loss:.3f}, Acc: {val_acc:.3f}%')\n\n        if val_acc > best_acc:\n            best_acc = val_acc\n            torch.save(model.state_dict(), os.path.join(config.out_dir, 'best_model.pth'))\n\n        scheduler.step()\n\n    return train_log_info, val_log_info, best_acc\n\n\ndef evaluate(model, dataloader, criterion, config):\n    model.eval()\n    val_loss = 0.0\n    val_correct = 0\n    val_total = 0\n\n    with torch.no_grad():\n        for inputs, targets in dataloader:\n            inputs, targets = inputs.to(config.device), targets.to(config.device)\n            outputs = model(inputs)\n            loss = criterion(outputs, targets)\n\n            val_loss += loss.item()\n            _, predicted = outputs.max(1)\n            val_total += targets.size(0)\n            val_correct += predicted.eq(targets).sum().item()\n\n    val_loss = val_loss / len(dataloader)\n    val_acc = 100. * val_correct / val_total\n\n    return val_loss, val_acc\n\n\ndef test(config):\n    model = MobileNetV3Small(num_classes=config.num_classes).to(config.device)\n    if config.compile_model:\n        print(\"Compiling the model for testing...\")\n        model = torch.compile(model)\n    model.load_state_dict(torch.load(os.path.join(config.out_dir, 'best_model.pth')))\n    _, test_loader = get_data_loaders(config)\n    criterion = nn.CrossEntropyLoss()\n\n    test_loss, test_acc = evaluate(model, test_loader, criterion, config)\n    print(f'Test - Loss: {test_loss:.3f}, Acc: {test_acc:.3f}%')\n    return test_loss, test_acc\n\n\ndef main():\n    parser = argparse.ArgumentParser(description=\"Train MobileNetV3 for Image Classification\")\n    parser.add_argument(\"--data_path\", type=str, default=\"./data\", help=\"Path to save/load the dataset\")\n    parser.add_argument(\"--batch_size\", type=int, default=128, help=\"Batch size\")\n    parser.add_argument(\"--learning_rate\", type=float, default=0.01, help=\"Initial learning rate\")\n    parser.add_argument(\"--epochs\", type=int, default=30, help=\"Number of epochs to train\")\n    parser.add_argument(\"--out_dir\", type=str, default=\"run_0\", help=\"Output directory\")\n    args = parser.parse_args()\n\n    os.makedirs(args.out_dir, exist_ok=True)\n    print(f\"Outputs will be saved to {args.out_dir}\")\n\n    # Define datasets and number of seeds per dataset\n    datasets = ['cifar10']  # For now, only CIFAR-10; can add 'cifar100' in the future\n    num_seeds = {\n        'cifar10': 1  # Change the number of seeds as desired\n    }\n\n    all_results = {}\n    final_infos = {}\n\n    for dataset in datasets:\n        final_info_list = []\n        for seed_offset in range(num_seeds[dataset]):\n            # Update the config for each run\n            config = Config(\n                data_path=args.data_path,\n                dataset=dataset,\n                batch_size=args.batch_size,\n                learning_rate=args.learning_rate,\n                epochs=args.epochs,\n                out_dir=args.out_dir,\n                seed=seed_offset  # Set the seed\n            )\n            os.makedirs(config.out_dir, exist_ok=True)\n            print(f\"Starting training for {dataset} with seed {seed_offset}\")\n            start_time = time.time()\n            train_log_info, val_log_info, best_acc = train(config)\n            total_time = time.time() - start_time\n\n            # Run test after training\n            test_loss, test_acc = test(config)\n\n            # Prepare final_info dictionary\n            final_info = {\n                \"best_val_acc\": best_acc,\n                \"test_acc\": test_acc,\n                \"total_train_time\": total_time,\n                \"config\": vars(config)\n            }\n            final_info_list.append(final_info)\n\n            # Store results in all_results\n            key_prefix = f\"{dataset}_{seed_offset}\"\n            all_results[f\"{key_prefix}_final_info\"] = final_info\n            all_results[f\"{key_prefix}_train_log_info\"] = train_log_info\n            all_results[f\"{key_prefix}_val_log_info\"] = val_log_info\n\n            print(f\"Training completed for {dataset} seed {seed_offset}. Best validation accuracy: {best_acc:.2f}%, Test accuracy: {test_acc:.2f}%\")\n\n        # Aggregate results over seeds\n        final_info_dict = {k: [d[k] for d in final_info_list if k in d] for k in final_info_list[0].keys()}\n        means = {f\"{k}_mean\": np.mean(v) for k, v in final_info_dict.items() if isinstance(v[0], (int, float, float))}\n        stderrs = {f\"{k}_stderr\": np.std(v) / np.sqrt(len(v)) for k, v in final_info_dict.items() if isinstance(v[0], (int, float, float))}\n        final_infos[dataset] = {\n            \"means\": means,\n            \"stderrs\": stderrs,\n            \"final_info_dict\": final_info_dict\n        }\n\n    # Save final_infos to final_info.json\n    with open(os.path.join(args.out_dir, \"final_info.json\"), \"w\") as f:\n        json.dump(final_infos, f, indent=2)\n\n    # Save all_results to all_results.npy\n    with open(os.path.join(args.out_dir, \"all_results.npy\"), \"wb\") as f:\n        np.save(f, all_results)\n\n    print(f\"All results saved to {args.out_dir}\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+        "seed_ideas": [
+          {
+            "name": "universal_inverted_bottleneck",
+            "title": "Implementing and Evaluating the Universal Inverted Bottleneck (UIB) Block",
+            "experiment": "mobilenetV3",
+            "interestingness": 9,
+            "feasibility": 7,
+            "novelty": 8
+          }
+        ]
+      }
+    },
+    {
+      "id": "mostly_safely_calm_bee",
+      "experiment": {
+        "name": "nanoGPT",
+        "task_description": "You are given the following file to work with, which trains multiple small language models on multiple datasets of text at the character level.",
+        "init_code": "import argparse\nimport inspect\nimport json\nimport math\nimport os\nimport pickle\nimport time\nfrom contextlib import nullcontext\nfrom dataclasses import dataclass\n\nimport numpy as np\nimport torch\nimport torch.nn as nn\nfrom torch.nn import functional as F\n\n\n# --- BEGIN model.py ---\nclass LayerNorm(nn.Module):\n    \"\"\"LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False\"\"\"\n\n    def __init__(self, ndim, bias):\n        super().__init__()\n        self.weight = nn.Parameter(torch.ones(ndim))\n        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None\n\n    def forward(self, input):\n        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)\n\n\nclass CausalSelfAttention(nn.Module):\n\n    def __init__(self, config):\n        super().__init__()\n        assert config.n_embd % config.n_head == 0\n        # key, query, value projections for all heads, but in a batch\n        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)\n        # output projection\n        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)\n        # regularization\n        self.attn_dropout = nn.Dropout(config.dropout)\n        self.resid_dropout = nn.Dropout(config.dropout)\n        self.n_head = config.n_head\n        self.n_embd = config.n_embd\n        self.dropout = config.dropout\n        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0\n        self.flash = hasattr(torch.nn.functional, \"scaled_dot_product_attention\")\n        if not self.flash:\n            print(\n                \"WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0\"\n            )\n            # causal mask to ensure that attention is only applied to the left in the input sequence\n            self.register_buffer(\n                \"bias\",\n                torch.tril(torch.ones(config.block_size, config.block_size)).view(\n                    1, 1, config.block_size, config.block_size\n                ),\n            )\n\n    def forward(self, x):\n        B, T, C = (\n            x.size()\n        )  # batch size, sequence length, embedding dimensionality (n_embd)\n\n        # calculate query, key, values for all heads in batch and move head forward to be the batch dim\n        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)\n        k = k.view(B, T, self.n_head, C // self.n_head).transpose(\n            1, 2\n        )  # (B, nh, T, hs)\n        q = q.view(B, T, self.n_head, C // self.n_head).transpose(\n            1, 2\n        )  # (B, nh, T, hs)\n        v = v.view(B, T, self.n_head, C // self.n_head).transpose(\n            1, 2\n        )  # (B, nh, T, hs)\n\n        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)\n        if self.flash:\n            # efficient attention using Flash Attention CUDA kernels\n            y = torch.nn.functional.scaled_dot_product_attention(\n                q,\n                k,\n                v,\n                attn_mask=None,\n                dropout_p=self.dropout if self.training else 0,\n                is_causal=True,\n            )\n        else:\n            # manual implementation of attention\n            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))\n            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float(\"-inf\"))\n            att = F.softmax(att, dim=-1)\n            att = self.attn_dropout(att)\n            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)\n        y = (\n            y.transpose(1, 2).contiguous().view(B, T, C)\n        )  # re-assemble all head outputs side by side\n\n        # output projection\n        y = self.resid_dropout(self.c_proj(y))\n        return y\n\n\nclass MLP(nn.Module):\n\n    def __init__(self, config):\n        super().__init__()\n        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)\n        self.gelu = nn.GELU()\n        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)\n        self.dropout = nn.Dropout(config.dropout)\n\n    def forward(self, x):\n        x = self.c_fc(x)\n        x = self.gelu(x)\n        x = self.c_proj(x)\n        x = self.dropout(x)\n        return x\n\n\nclass Block(nn.Module):\n\n    def __init__(self, config):\n        super().__init__()\n        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)\n        self.attn = CausalSelfAttention(config)\n        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)\n        self.mlp = MLP(config)\n\n    def forward(self, x):\n        x = x + self.attn(self.ln_1(x))\n        x = x + self.mlp(self.ln_2(x))\n        return x\n\n\n@dataclass\nclass GPTConfig:\n    block_size: int = 1024\n    vocab_size: int = (\n        50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency\n    )\n    n_layer: int = 12\n    n_head: int = 12\n    n_embd: int = 768\n    dropout: float = 0.0\n    bias: bool = (\n        True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster\n    )\n\n\nclass GPT(nn.Module):\n\n    def __init__(self, config):\n        super().__init__()\n        assert config.vocab_size is not None\n        assert config.block_size is not None\n        self.config = config\n\n        self.transformer = nn.ModuleDict(\n            dict(\n                wte=nn.Embedding(config.vocab_size, config.n_embd),\n                wpe=nn.Embedding(config.block_size, config.n_embd),\n                drop=nn.Dropout(config.dropout),\n                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),\n                ln_f=LayerNorm(config.n_embd, bias=config.bias),\n            )\n        )\n        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)\n        # with weight tying when using torch.compile() some warnings get generated:\n        # \"UserWarning: functional_call was passed multiple values for tied weights.\n        # This behavior is deprecated and will be an error in future versions\"\n        # not 100% sure what this is, so far seems to be harmless. TODO investigate\n        self.transformer.wte.weight = (\n            self.lm_head.weight\n        )  # https://paperswithcode.com/method/weight-tying\n\n        # init all weights\n        self.apply(self._init_weights)\n        # apply special scaled init to the residual projections, per GPT-2 paper\n        for pn, p in self.named_parameters():\n            if pn.endswith(\"c_proj.weight\"):\n                torch.nn.init.normal_(\n                    p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer)\n                )\n\n        # report number of parameters\n        print(\"number of parameters: %.2fM\" % (self.get_num_params() / 1e6,))\n\n    def get_num_params(self, non_embedding=True):\n        \"\"\"\n        Return the number of parameters in the model.\n        For non-embedding count (default), the position embeddings get subtracted.\n        The token embeddings would too, except due to the parameter sharing these\n        params are actually used as weights in the final layer, so we include them.\n        \"\"\"\n        n_params = sum(p.numel() for p in self.parameters())\n        if non_embedding:\n            n_params -= self.transformer.wpe.weight.numel()\n        return n_params\n\n    def _init_weights(self, module):\n        if isinstance(module, nn.Linear):\n            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)\n            if module.bias is not None:\n                torch.nn.init.zeros_(module.bias)\n        elif isinstance(module, nn.Embedding):\n            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)\n\n    def forward(self, idx, targets=None):\n        device = idx.device\n        b, t = idx.size()\n        assert (\n                t <= self.config.block_size\n        ), f\"Cannot forward sequence of length {t}, block size is only {self.config.block_size}\"\n        pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)\n\n        # forward the GPT model itself\n        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)\n        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)\n        x = self.transformer.drop(tok_emb + pos_emb)\n        for block in self.transformer.h:\n            x = block(x)\n        x = self.transformer.ln_f(x)\n\n        if targets is not None:\n            # if we are given some desired targets also calculate the loss\n            logits = self.lm_head(x)\n            loss = F.cross_entropy(\n                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1\n            )\n        else:\n            # inference-time mini-optimization: only forward the lm_head on the very last position\n            logits = self.lm_head(\n                x[:, [-1], :]\n            )  # note: using list [-1] to preserve the time dim\n            loss = None\n\n        return logits, loss\n\n    def crop_block_size(self, block_size):\n        # model surgery to decrease the block size if necessary\n        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)\n        # but want to use a smaller block size for some smaller, simpler model\n        assert block_size <= self.config.block_size\n        self.config.block_size = block_size\n        self.transformer.wpe.weight = nn.Parameter(\n            self.transformer.wpe.weight[:block_size]\n        )\n        for block in self.transformer.h:\n            if hasattr(block.attn, \"bias\"):\n                block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]\n\n    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):\n        # start with all of the candidate parameters\n        param_dict = {pn: p for pn, p in self.named_parameters()}\n        # filter out those that do not require grad\n        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}\n        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.\n        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.\n        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]\n        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]\n        optim_groups = [\n            {\"params\": decay_params, \"weight_decay\": weight_decay},\n            {\"params\": nodecay_params, \"weight_decay\": 0.0},\n        ]\n        num_decay_params = sum(p.numel() for p in decay_params)\n        num_nodecay_params = sum(p.numel() for p in nodecay_params)\n        print(\n            f\"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters\"\n        )\n        print(\n            f\"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters\"\n        )\n        # Create AdamW optimizer and use the fused version if it is available\n        fused_available = \"fused\" in inspect.signature(torch.optim.AdamW).parameters\n        use_fused = fused_available and device_type == \"cuda\"\n        extra_args = dict(fused=True) if use_fused else dict()\n        optimizer = torch.optim.AdamW(\n            optim_groups, lr=learning_rate, betas=betas, **extra_args\n        )\n        print(f\"using fused AdamW: {use_fused}\")\n\n        return optimizer\n\n    @torch.no_grad()\n    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):\n        \"\"\"\n        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete\n        the sequence max_new_tokens times, feeding the predictions back into the model each time.\n        Most likely you'll want to make sure to be in model.eval() mode of operation for this.\n        \"\"\"\n        for _ in range(max_new_tokens):\n            # if the sequence context is growing too long we must crop it at block_size\n            idx_cond = (\n                idx\n                if idx.size(1) <= self.config.block_size\n                else idx[:, -self.config.block_size:]\n            )\n            # forward the model to get the logits for the index in the sequence\n            logits, _ = self(idx_cond)\n            # pluck the logits at the final step and scale by desired temperature\n            logits = logits[:, -1, :] / temperature\n            # optionally crop the logits to only the top k options\n            if top_k is not None:\n                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))\n                logits[logits < v[:, [-1]]] = -float(\"Inf\")\n            # apply softmax to convert logits to (normalized) probabilities\n            probs = F.softmax(logits, dim=-1)\n            # sample from the distribution\n            idx_next = torch.multinomial(probs, num_samples=1)\n            # append sampled index to the running sequence and continue\n            idx = torch.cat((idx, idx_next), dim=1)\n\n        return idx\n\n\n# --- END model.py ---\ndef train(dataset=\"shakespeare_char\", out_dir=\"run_0\", seed_offset=0):\n    # -----------------------------------------------------------------------------\n    # default config values designed to train a gpt2 (124M) on OpenWebText\n    # data\n    gradient_accumulation_steps = 1\n    batch_size = 64 if dataset == \"shakespeare_char\" else 32\n    block_size = 256  # context of up to 256 previous characters\n    # I/O\n    eval_interval = 250 if dataset == \"shakespeare_char\" else 1000\n    log_interval = 10 if dataset == \"shakespeare_char\" else 100\n    eval_iters = 200\n    eval_only = False  # if True, script exits right after the first eval\n    always_save_checkpoint = False  # we expect to overfit on this small dataset, so only save when val improves\n    never_save_checkpoint = True  # never save checkpoints\n    # model\n    n_layer = 6  # baby GPT model :)\n    n_head = 6\n    n_embd = 384\n    dropout = 0.2  # for pretraining 0 is good, for finetuning try 0.1+\n    bias = False  # do we use bias inside LayerNorm and Linear layers?\n    # adamw optimizer\n    learning_rate = 1e-3 if dataset == \"shakespeare_char\" else 5e-4\n    max_iters = 5000 if dataset == \"shakespeare_char\" else 100000\n    weight_decay = 1e-1\n    beta1 = 0.9\n    beta2 = 0.99  # make a bit bigger because number of tokens per iter is small\n    grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0\n    # learning rate decay settings\n    decay_lr = True  # whether to decay the learning rate\n    warmup_iters = 100 if dataset == \"shakespeare_char\" else 200\n    lr_decay_iters = max_iters  # make equal to max_iters usually\n    min_lr = 1e-4 if dataset == \"shakespeare_char\" else 5e-5\n    # DDP settings\n    backend = \"nccl\"  # 'nccl', 'gloo', etc.\n    # system\n    device = \"cuda\"  # Always use CUDA\n    dtype = (\n        \"bfloat16\"\n        if torch.cuda.is_available() and torch.cuda.is_bf16_supported()\n        else \"float16\"\n    )  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler\n    compile = True  # do not torch compile the model on macbooks\n\n    # various inits, derived attributes, I/O setup\n    # if not ddp, we are running on a single gpu, and one process\n    master_process = True\n    tokens_per_iter = gradient_accumulation_steps * batch_size * block_size\n    print(f\"tokens per iteration will be: {tokens_per_iter:,}\")\n\n    if master_process:\n        os.makedirs(out_dir, exist_ok=True)\n    torch.manual_seed(1337 + seed_offset)\n    torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul\n    torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn\n    device_type = (\n        \"cuda\" if \"cuda\" in device else \"cpu\"\n    )  # for later use in torch.autocast\n    # note: float16 data type will automatically use a GradScaler\n    ptdtype = {\n        \"float32\": torch.float32,\n        \"bfloat16\": torch.bfloat16,\n        \"float16\": torch.float16,\n    }[dtype]\n    ctx = (\n        nullcontext()\n        if device_type == \"cpu\"\n        else torch.amp.autocast(device_type=device_type, dtype=ptdtype)\n    )\n\n    # poor man's data loader\n    if out_dir == \"run_0\":\n        data_dir = os.path.join(\"../../data\", dataset)\n    else:\n        data_dir = os.path.join(\"../../../data\", dataset)\n\n    def get_batch(split):\n        # We recreate np.memmap every batch to avoid a memory leak, as per\n        # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122\n        if split == \"train\":\n            data = np.memmap(\n                os.path.join(data_dir, \"train.bin\"), dtype=np.uint16, mode=\"r\"\n            )\n        else:\n            data = np.memmap(\n                os.path.join(data_dir, \"val.bin\"), dtype=np.uint16, mode=\"r\"\n            )\n        ix = torch.randint(len(data) - block_size, (batch_size,))\n        x = torch.stack(\n            [torch.from_numpy((data[i: i + block_size]).astype(np.int64)) for i in ix]\n        )\n        y = torch.stack(\n            [\n                torch.from_numpy((data[i + 1: i + 1 + block_size]).astype(np.int64))\n                for i in ix\n            ]\n        )\n        if device_type == \"cuda\":\n            # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)\n            x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(\n                device, non_blocking=True\n            )\n        else:\n            x, y = x.to(device), y.to(device)\n        return x, y\n\n    iter_num = 0\n    best_val_loss = 1e9\n\n    # attempt to derive vocab_size from the dataset\n    meta_path = os.path.join(data_dir, \"meta.pkl\")\n    meta_vocab_size = None\n    if os.path.exists(meta_path):\n        with open(meta_path, \"rb\") as f:\n            meta = pickle.load(f)\n        meta_vocab_size = meta[\"vocab_size\"]\n        print(f\"found vocab_size = {meta_vocab_size} (inside {meta_path})\")\n\n    # model init\n    model_args = dict(\n        n_layer=n_layer,\n        n_head=n_head,\n        n_embd=n_embd,\n        block_size=block_size,\n        bias=bias,\n        vocab_size=None,\n        dropout=dropout,\n    )  # start with model_args from command line\n    # init a new model from scratch\n    print(\"Initializing a new model from scratch\")\n    # determine the vocab size we'll use for from-scratch training\n    if meta_vocab_size is None:\n        print(\n            \"defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)\"\n        )\n    model_args[\"vocab_size\"] = meta_vocab_size if meta_vocab_size is not None else 50304\n    gptconf = GPTConfig(**model_args)\n    model = GPT(gptconf)\n    # crop down the model block size if desired, using model surgery\n    if block_size < model.config.block_size:\n        model.crop_block_size(block_size)\n        model_args[\"block_size\"] = (\n            block_size  # so that the checkpoint will have the right value\n        )\n    model.to(device)\n\n    # initialize a GradScaler. If enabled=False scaler is a no-op\n    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == \"float16\"))\n\n    # optimizer\n    optimizer = model.configure_optimizers(\n        weight_decay, learning_rate, (beta1, beta2), device_type\n    )\n    checkpoint = None  # free up memory\n\n    # compile the model\n    if compile:\n        print(\"compiling the model... (takes a ~minute)\")\n        unoptimized_model = model\n        model = torch.compile(model)  # requires PyTorch 2.0\n\n    # helps estimate an arbitrarily accurate loss over either split using many batches\n    @torch.no_grad()\n    def estimate_loss():\n        out = {}\n        model.eval()\n        for split in [\"train\", \"val\"]:\n            losses = torch.zeros(eval_iters)\n            for k in range(eval_iters):\n                X, Y = get_batch(split)\n                with ctx:\n                    logits, loss = model(X, Y)\n                losses[k] = loss.item()\n            out[split] = losses.mean()\n        model.train()\n        return out\n\n    # learning rate decay scheduler (cosine with warmup)\n    def get_lr(it):\n        # 1) linear warmup for warmup_iters steps\n        if it < warmup_iters:\n            return learning_rate * it / warmup_iters\n        # 2) if it > lr_decay_iters, return min learning rate\n        if it > lr_decay_iters:\n            return min_lr\n        # 3) in between, use cosine decay down to min learning rate\n        decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)\n        assert 0 <= decay_ratio <= 1\n        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1\n        return min_lr + coeff * (learning_rate - min_lr)\n\n    # logging\n    val_log_info = []\n    train_log_info = []\n\n    # training loop\n    X, Y = get_batch(\"train\")  # fetch the very first batch\n    og_t0 = time.time()\n    t0 = time.time()\n    local_iter_num = 0  # number of iterations in the lifetime of this process\n    raw_model = model\n    while True:\n\n        # determine and set the learning rate for this iteration\n        lr = get_lr(iter_num) if decay_lr else learning_rate\n        for param_group in optimizer.param_groups:\n            param_group[\"lr\"] = lr\n\n        # evaluate the loss on train/val sets and write checkpoints\n        if iter_num % eval_interval == 0 and master_process:\n            losses = estimate_loss()\n            print(\n                f\"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}\"\n            )\n            val_log_info.append(\n                {\n                    \"iter\": iter_num,\n                    \"train/loss\": losses[\"train\"].item(),\n                    \"val/loss\": losses[\"val\"].item(),\n                    \"lr\": lr,\n                }\n            )\n            if losses[\"val\"] < best_val_loss or always_save_checkpoint:\n                best_val_loss = losses[\"val\"]\n                if iter_num > 0 and not never_save_checkpoint:\n                    checkpoint = {\n                        \"model\": raw_model.state_dict(),\n                        \"optimizer\": optimizer.state_dict(),\n                        \"model_args\": model_args,\n                        \"iter_num\": iter_num,\n                        \"best_val_loss\": best_val_loss,\n                    }\n                    print(f\"saving checkpoint to {out_dir}\")\n                    torch.save(checkpoint, os.path.join(out_dir, \"ckpt.pt\"))\n        if iter_num == 0 and eval_only:\n            break\n\n        # forward backward update, with optional gradient accumulation to simulate larger batch size\n        # and using the GradScaler if data type is float16\n        for micro_step in range(gradient_accumulation_steps):\n            with ctx:\n                logits, loss = model(X, Y)\n                loss = (\n                        loss / gradient_accumulation_steps\n                )  # scale the loss to account for gradient accumulation\n            # immediately async prefetch next batch while model is doing the forward pass on the GPU\n            X, Y = get_batch(\"train\")\n            # backward pass, with gradient scaling if training in fp16\n            scaler.scale(loss).backward()\n        # clip the gradient\n        if grad_clip != 0.0:\n            scaler.unscale_(optimizer)\n            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)\n        # step the optimizer and scaler if training in fp16\n        scaler.step(optimizer)\n        scaler.update()\n        # flush the gradients as soon as we can, no need for this memory anymore\n        optimizer.zero_grad(set_to_none=True)\n\n        # timing and logging\n        t1 = time.time()\n        dt = t1 - t0\n        t0 = t1\n        if iter_num % log_interval == 0 and master_process:\n            # get loss as float. note: this is a CPU-GPU sync point\n            # scale up to undo the division above, approximating the true total loss (exact would have been a sum)\n            lossf = loss.item() * gradient_accumulation_steps\n            print(f\"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms\")\n            train_log_info.append(\n                {\n                    \"iter\": iter_num,\n                    \"loss\": lossf,\n                    \"time\": dt * 1000,\n                }\n            )\n        iter_num += 1\n        local_iter_num += 1\n\n        # termination conditions\n        if iter_num > max_iters:\n            break\n\n    print(\"training done\")\n    print(f\"Best validation loss: {best_val_loss}\")\n    print(f\"Total train time: {(time.time() - og_t0) / 60:.2f} mins\")\n\n    final_info = {\n        \"final_train_loss\": lossf,\n        \"best_val_loss\": best_val_loss.item(),\n        \"total_train_time\": time.time() - og_t0,\n    }\n\n    # === SAMPLING SCRIPT ===\n\n    # New parameters for generation\n    start = \" \"\n    num_samples = 10  # number of samples to draw\n    max_new_tokens = 500  # number of tokens generated in each sample\n    temperature = (\n        0.8  # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions\n    )\n    top_k = 200  # retain only the top_k most likely tokens, clamp others to have 0 probability\n\n    # Encoding setup\n    assert os.path.exists(\n        meta_path\n    ), \"meta.pkl not found, please run training script first\"\n    print(f\"Loading meta from {meta_path}...\")\n    with open(meta_path, \"rb\") as f:\n        meta = pickle.load(f)\n    stoi, itos = meta[\"stoi\"], meta[\"itos\"]\n    encode = lambda s: [stoi[c] for c in s]\n    decode = lambda l: \"\".join([itos[i] for i in l])\n\n    # Encode the beginning of the prompt\n    if start.startswith(\"FILE:\"):\n        with open(start[5:], \"r\", encoding=\"utf-8\") as f:\n            start = f.read()\n    start_ids = encode(start)\n    x = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]\n\n    # Run generation\n    model.eval()\n    results = []\n    with torch.no_grad():\n        with ctx:\n            for k in range(num_samples):\n                start_time = time.time()\n                y = model.generate(\n                    x, max_new_tokens, temperature=temperature, top_k=top_k\n                )\n                end_time = time.time()\n\n                generated_text = decode(y[0].tolist())\n                inference_time = end_time - start_time\n                tokens_per_second = max_new_tokens / inference_time\n\n                print(f\"Sample {k + 1}:\")\n                print(generated_text)\n                print(f\"Inference time: {inference_time:.2f} seconds\")\n                print(f\"Tokens per second: {tokens_per_second:.2f}\")\n                print(\"---------------\")\n\n                results.append(\n                    {\n                        \"sample_id\": k + 1,\n                        \"generated_text\": generated_text,\n                        \"inference_time\": inference_time,\n                        \"tokens_per_second\": tokens_per_second,\n                    }\n                )\n\n    # Calculate and print average inference speed\n    avg_tokens_per_second = sum(r[\"tokens_per_second\"] for r in results) / len(results)\n    print(f\"Average tokens per second: {avg_tokens_per_second:.2f}\")\n\n    final_info[\"avg_inference_tokens_per_second\"] = avg_tokens_per_second\n\n    with open(\n            os.path.join(out_dir, f\"final_info_{dataset}_{seed_offset}.json\"), \"w\"\n    ) as f:\n        json.dump(final_info, f)\n    return final_info, train_log_info, val_log_info\n\n\nparser = argparse.ArgumentParser(description=\"Run experiment\")\nparser.add_argument(\"--out_dir\", type=str, default=\"run_0\", help=\"Output directory\")\nargs = parser.parse_args()\n\nif __name__ == \"__main__\":\n    num_seeds = {\n        \"shakespeare_char\": 3,\n        \"enwik8\": 1,\n        \"text8\": 1,\n    }\n\n    out_dir = args.out_dir\n    all_results = {}\n    final_infos = {}\n    for dataset in [\"shakespeare_char\", \"enwik8\", \"text8\"]:\n        final_info_list = []\n        for seed_offset in range(num_seeds[dataset]):\n            final_info, train_info, val_info = train(dataset, out_dir, seed_offset)\n            all_results[f\"{dataset}_{seed_offset}_final_info\"] = final_info\n            all_results[f\"{dataset}_{seed_offset}_train_info\"] = train_info\n            all_results[f\"{dataset}_{seed_offset}_val_info\"] = val_info\n            final_info_list.append(final_info)\n        final_info_dict = {\n            k: [d[k] for d in final_info_list] for k in final_info_list[0].keys()\n        }\n        means = {f\"{k}_mean\": np.mean(v) for k, v in final_info_dict.items()}\n        stderrs = {\n            f\"{k}_stderr\": np.std(v) / len(v) for k, v in final_info_dict.items()\n        }\n        final_infos[dataset] = {\n            \"means\": means,\n            \"stderrs\": stderrs,\n            \"final_info_dict\": final_info_dict,\n        }\n\n    with open(os.path.join(out_dir, \"final_info.json\"), \"w\") as f:\n        json.dump(final_infos, f)\n\n    with open(os.path.join(out_dir, \"all_results.npy\"), \"wb\") as f:\n        np.save(f, all_results)\n",
+        "seed_ideas": [
+          {
+            "name": "adaptive_block_size",
+            "title": "Adaptive Block Size: Dynamic Context Window Adjustment for Efficient Training",
+            "experiment": "nanoGPT",
+            "interestingness": 6,
+            "feasibility": 4,
+            "novelty": 4
+          },
+          {
+            "name": "layerwise_learning_rates",
+            "title": "Layer-wise Learning Rate Adaptation: Optimizing Training Dynamics in Transformer Models",
+            "experiment": "nanoGPT",
+            "interestingness": 4,
+            "feasibility": 6,
+            "novelty": 2
+          },
+          {
+            "name": "attention_diversity_regularization",
+            "title": "Attention Diversity Regularization: Encouraging Diverse Context Window Utilization in Transformers",
+            "experiment": "nanoGPT",
+            "interestingness": 7,
+            "feasibility": 6,
+            "novelty": 5
+          },
+          {
+            "name": "ntm_augmented_transformer",
+            "title": "Neural Turing Machine-Augmented Transformer: Improving Text Generation with External Memory",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 6
+          },
+          {
+            "name": "uncertainty_based_filtering",
+            "title": "Uncertainty-Based Filtering: Reducing Hallucinations in Text Generation by Selecting High-Certainty Predictions",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 6
+          },
+          {
+            "name": "targeted_knowledge_distillation",
+            "title": "Targeted Knowledge Distillation for Transformer-Based Language Models: A Study on Distilling Specific Aspects of Model Behavior",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 7
+          },
+          {
+            "name": "fine_tuning_gpt",
+            "title": "Fine-Tuning for Task Adaptation: A Study on Adapting Pre-Trained GPT Models to New Tasks",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 6
+          },
+          {
+            "name": "training_data_ordering",
+            "title": "The Impact of Training Data Ordering on Language Model Performance",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 7
+          },
+          {
+            "name": "memory_buffer_transformer",
+            "title": "Memory Buffer Transformer: Improving Long-Range Dependency Modeling with a Simple Memory Mechanism",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 7
+          },
+          {
+            "name": "meta_attention_gpt",
+            "title": "Meta-Learning for Adaptive Attention in GPT Models",
+            "experiment": "nanoGPT",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "word_dropout_auxiliary_task",
+            "title": "Word Dropout Auxiliary Task: Improving Language Understanding through Multi-Task Learning",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 7
+          },
+          {
+            "name": "temporal_regularization",
+            "title": "Temporal Regularization for Mitigating Catastrophic Forgetting in Language Models",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 7
+          },
+          {
+            "name": "graph_augmented_gpt",
+            "title": "Graph-Augmented GPT for Improved Entity Relationship Modeling",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 7
+          },
+          {
+            "name": "bias_aware_gpt",
+            "title": "Bias-Aware GPT: A Self-Aware Language Model for Mitigating Biases",
+            "experiment": "nanoGPT",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "multi_objective_gpt",
+            "title": "Multi-Objective Optimization for GPT Models: A Study on Language Modeling and Sentiment Analysis",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "attention_dropout_transformer",
+            "title": "Attention Dropout Transformer: Regularizing the Model with Targeted Dropout",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 7
+          },
+          {
+            "name": "domain_knowledge_graph_gpt",
+            "title": "Domain-Specific Knowledge Graph-Augmented GPT for Improved Reasoning and Inference",
+            "experiment": "nanoGPT",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 7
+          },
+          {
+            "name": "difficulty_aware_sampling",
+            "title": "Difficulty-Aware Sampling for Language Modeling: A Study on Dynamic Learning Objectives",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 7
+          },
+          {
+            "name": "discrete_time_echo_state_gpt",
+            "title": "Discrete-Time Echo State Networks for Efficient Temporal Modeling in GPT",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 8
+          },
+          {
+            "name": "input_complexity_adaptation",
+            "title": "Input Complexity Adaptation for Efficient Language Modeling",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 7
+          },
+          {
+            "name": "linguistic_complexity_manipulation",
+            "title": "Linguistic Complexity Manipulation for Language Models: A Study on Performance and Generalization",
+            "experiment": "nanoGPT",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "temporal_knowledge_forgetting_gpt",
+            "title": "Temporal Knowledge Forgetting in Language Models: A Study on Adapting to Sudden Changes in Data Distributions",
+            "experiment": "nanoGPT",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "monte_carlo_confidence_aware_gpt",
+            "title": "Monte Carlo Confidence-Aware GPT: Estimating Uncertainty via Dropout",
+            "experiment": "nanoGPT",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "calibrated_confidence_aware_gpt",
+            "title": "Calibrated Confidence-Aware GPT: Estimating Uncertainty in Language Modeling",
+            "experiment": "nanoGPT",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "factual_knowledge_neurons",
+            "title": "Identifying Factual Knowledge Neurons in Language Models",
+            "experiment": "nanoGPT",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "domain_adaptation_meta_learning",
+            "title": "Domain Adaptation via Meta-Learning for Language Modeling",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "dual_scale_attention_gpt",
+            "title": "Dual-Scale Attention in GPT: Capturing Long-Range Dependencies with Sparse Attention",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 7
+          },
+          {
+            "name": "multimodal_emotionally_intelligent_gpt",
+            "title": "Multimodal Emotionally Intelligent GPT: Generating Text that Understands and Expresses Emotions",
+            "experiment": "nanoGPT",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "availability_heuristic_gpt",
+            "title": "Availability Heuristic-Aware GPT: Simulating Human-Like Conversational Flow in Language Generation",
+            "experiment": "nanoGPT",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "interpretable_dynamic_attention_gpt",
+            "title": "Interpretable Dynamic Attention GPT: A Multi-Task Learning Approach to Adaptive Context Window Size",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 8
+          },
+          {
+            "name": "recency_effect_gpt",
+            "title": "Recency Effect-Aware GPT: Simulating Human-Like Decision-Making in Language Generation",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "idiomatic_gpt",
+            "title": "Idiomatic GPT: A Language Model with Idiom Recognition and Generation",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 8
+          },
+          {
+            "name": "selective_forgetting_gpt",
+            "title": "Selective Forgetting in GPT: A Novel Approach to Memory Consolidation",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 8
+          },
+          {
+            "name": "syntactic_complexity_analysis",
+            "title": "Syntactic Complexity Analysis in Language Models",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "linguistic_difficulty_gpt",
+            "title": "Linguistic Difficulty-Aware GPT: Using Linguistic Features to Predict Input Text Complexity",
+            "experiment": "nanoGPT",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "linguistic_complexity_aware_gpt",
+            "title": "Linguistic Complexity-Aware GPT: Improving Performance on Complex Input Texts",
+            "experiment": "nanoGPT",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "recency_effect_gpt",
+            "title": "Incorporating the Recency Effect into Language Models for More Coherent and Context-Dependent Text Generation",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "dynamic_attention_gpt",
+            "title": "Dynamic Attention GPT: Adapting to Varying Levels of Cognitive Load",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "primacy_effect_gpt",
+            "title": "The Primacy Effect in Language Models: Exploring the Impact on Text Completion",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 7
+          },
+          {
+            "name": "novelty_conditioned_gpt",
+            "title": "Novelty-Conditioned GPT: Adjusting Language Generation based on Input Novelty",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "availability_heuristic_gpt",
+            "title": "Availability Heuristic in GPT: Exploring the Impact of Recent Information on Language Generation",
+            "experiment": "nanoGPT",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "frequency_based_forgetting_gpt",
+            "title": "Frequency-Based Forgetting in GPT: Exploring the Impact of Forgetting on Language Model Performance",
+            "experiment": "nanoGPT",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "curiosity_driven_gpt",
+            "title": "Curiosity-Driven Language Modeling: Exploring Novel Patterns in Input Data",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "semantic_drift_analysis",
+            "title": "Semantic Drift Analysis in Language Models: A Study on Temporal Changes in Text",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 8
+          },
+          {
+            "name": "syntactic_complexity_aware_gpt",
+            "title": "Syntactic Complexity-Aware GPT: Adapting Attention to Syntactic Complexity",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "entity_relationship_gpt",
+            "title": "Entity Relationship-Augmented GPT: Improving Reasoning about Entities and Relationships",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "meta_forgetting_gpt",
+            "title": "Meta-Forgetting in Language Models: A Study on Intentional Forgetting for Improved Generalization",
+            "experiment": "nanoGPT",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "domain_invariant_reps",
+            "title": "Learning Domain-Invariant Representations for Language Modeling",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 8
+          },
+          {
+            "name": "information_density_aware_gpt",
+            "title": "Information Density-Aware GPT: Adapting Attention to Information Density",
+            "experiment": "nanoGPT",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "syntactic_complexity_aware_gpt",
+            "title": "Syntactic Complexity-Aware GPT: Adapting Attention to Syntactic Complexity",
+            "experiment": "nanoGPT",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "cognitive_load_aware_gpt",
+            "title": "Cognitive Load-Aware GPT: Adapting Attention to Cognitive Load",
+            "experiment": "nanoGPT",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "contrastive_forgetting_gpt",
+            "title": "Contrastive Forgetting in Language Models: Preserving General Knowledge while Forgetting Domain-Specific Patterns",
+            "experiment": "nanoGPT",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 8
+          }
+        ]
+      }
+    },
+    {
+      "id": "newly_widely_sacred_moray",
+      "experiment": {
+        "name": "nanoGPT_lite",
+        "task_description": "You are given the following file to work with, which trains small language models on a dataset of text at the character level.",
+        "init_code": "import argparse\nimport inspect\nimport json\nimport math\nimport os\nimport pickle\nimport time\nfrom contextlib import nullcontext\nfrom dataclasses import dataclass\n\nimport numpy as np\nimport torch\nimport torch.nn as nn\nfrom torch.nn import functional as F\n\n\n# --- BEGIN model.py ---\nclass LayerNorm(nn.Module):\n    \"\"\"LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False\"\"\"\n\n    def __init__(self, ndim, bias):\n        super().__init__()\n        self.weight = nn.Parameter(torch.ones(ndim))\n        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None\n\n    def forward(self, input):\n        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)\n\n\nclass CausalSelfAttention(nn.Module):\n\n    def __init__(self, config):\n        super().__init__()\n        assert config.n_embd % config.n_head == 0\n        # key, query, value projections for all heads, but in a batch\n        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)\n        # output projection\n        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)\n        # regularization\n        self.attn_dropout = nn.Dropout(config.dropout)\n        self.resid_dropout = nn.Dropout(config.dropout)\n        self.n_head = config.n_head\n        self.n_embd = config.n_embd\n        self.dropout = config.dropout\n        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0\n        self.flash = hasattr(torch.nn.functional, \"scaled_dot_product_attention\")\n        if not self.flash:\n            print(\n                \"WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0\"\n            )\n            # causal mask to ensure that attention is only applied to the left in the input sequence\n            self.register_buffer(\n                \"bias\",\n                torch.tril(torch.ones(config.block_size, config.block_size)).view(\n                    1, 1, config.block_size, config.block_size\n                ),\n            )\n\n    def forward(self, x):\n        B, T, C = (\n            x.size()\n        )  # batch size, sequence length, embedding dimensionality (n_embd)\n\n        # calculate query, key, values for all heads in batch and move head forward to be the batch dim\n        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)\n        k = k.view(B, T, self.n_head, C // self.n_head).transpose(\n            1, 2\n        )  # (B, nh, T, hs)\n        q = q.view(B, T, self.n_head, C // self.n_head).transpose(\n            1, 2\n        )  # (B, nh, T, hs)\n        v = v.view(B, T, self.n_head, C // self.n_head).transpose(\n            1, 2\n        )  # (B, nh, T, hs)\n\n        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)\n        if self.flash:\n            # efficient attention using Flash Attention CUDA kernels\n            y = torch.nn.functional.scaled_dot_product_attention(\n                q,\n                k,\n                v,\n                attn_mask=None,\n                dropout_p=self.dropout if self.training else 0,\n                is_causal=True,\n            )\n        else:\n            # manual implementation of attention\n            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))\n            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float(\"-inf\"))\n            att = F.softmax(att, dim=-1)\n            att = self.attn_dropout(att)\n            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)\n        y = (\n            y.transpose(1, 2).contiguous().view(B, T, C)\n        )  # re-assemble all head outputs side by side\n\n        # output projection\n        y = self.resid_dropout(self.c_proj(y))\n        return y\n\n\nclass MLP(nn.Module):\n\n    def __init__(self, config):\n        super().__init__()\n        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)\n        self.gelu = nn.GELU()\n        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)\n        self.dropout = nn.Dropout(config.dropout)\n\n    def forward(self, x):\n        x = self.c_fc(x)\n        x = self.gelu(x)\n        x = self.c_proj(x)\n        x = self.dropout(x)\n        return x\n\n\nclass Block(nn.Module):\n\n    def __init__(self, config):\n        super().__init__()\n        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)\n        self.attn = CausalSelfAttention(config)\n        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)\n        self.mlp = MLP(config)\n\n    def forward(self, x):\n        x = x + self.attn(self.ln_1(x))\n        x = x + self.mlp(self.ln_2(x))\n        return x\n\n\n@dataclass\nclass GPTConfig:\n    block_size: int = 1024\n    vocab_size: int = (\n        50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency\n    )\n    n_layer: int = 12\n    n_head: int = 12\n    n_embd: int = 768\n    dropout: float = 0.0\n    bias: bool = (\n        True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster\n    )\n\n\nclass GPT(nn.Module):\n\n    def __init__(self, config):\n        super().__init__()\n        assert config.vocab_size is not None\n        assert config.block_size is not None\n        self.config = config\n\n        self.transformer = nn.ModuleDict(\n            dict(\n                wte=nn.Embedding(config.vocab_size, config.n_embd),\n                wpe=nn.Embedding(config.block_size, config.n_embd),\n                drop=nn.Dropout(config.dropout),\n                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),\n                ln_f=LayerNorm(config.n_embd, bias=config.bias),\n            )\n        )\n        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)\n        # with weight tying when using torch.compile() some warnings get generated:\n        # \"UserWarning: functional_call was passed multiple values for tied weights.\n        # This behavior is deprecated and will be an error in future versions\"\n        # not 100% sure what this is, so far seems to be harmless. TODO investigate\n        self.transformer.wte.weight = (\n            self.lm_head.weight\n        )  # https://paperswithcode.com/method/weight-tying\n\n        # init all weights\n        self.apply(self._init_weights)\n        # apply special scaled init to the residual projections, per GPT-2 paper\n        for pn, p in self.named_parameters():\n            if pn.endswith(\"c_proj.weight\"):\n                torch.nn.init.normal_(\n                    p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer)\n                )\n\n        # report number of parameters\n        print(\"number of parameters: %.2fM\" % (self.get_num_params() / 1e6,))\n\n    def get_num_params(self, non_embedding=True):\n        \"\"\"\n        Return the number of parameters in the model.\n        For non-embedding count (default), the position embeddings get subtracted.\n        The token embeddings would too, except due to the parameter sharing these\n        params are actually used as weights in the final layer, so we include them.\n        \"\"\"\n        n_params = sum(p.numel() for p in self.parameters())\n        if non_embedding:\n            n_params -= self.transformer.wpe.weight.numel()\n        return n_params\n\n    def _init_weights(self, module):\n        if isinstance(module, nn.Linear):\n            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)\n            if module.bias is not None:\n                torch.nn.init.zeros_(module.bias)\n        elif isinstance(module, nn.Embedding):\n            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)\n\n    def forward(self, idx, targets=None):\n        device = idx.device\n        b, t = idx.size()\n        assert (\n                t <= self.config.block_size\n        ), f\"Cannot forward sequence of length {t}, block size is only {self.config.block_size}\"\n        pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)\n\n        # forward the GPT model itself\n        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)\n        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)\n        x = self.transformer.drop(tok_emb + pos_emb)\n        for block in self.transformer.h:\n            x = block(x)\n        x = self.transformer.ln_f(x)\n\n        if targets is not None:\n            # if we are given some desired targets also calculate the loss\n            logits = self.lm_head(x)\n            loss = F.cross_entropy(\n                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1\n            )\n        else:\n            # inference-time mini-optimization: only forward the lm_head on the very last position\n            logits = self.lm_head(\n                x[:, [-1], :]\n            )  # note: using list [-1] to preserve the time dim\n            loss = None\n\n        return logits, loss\n\n    def crop_block_size(self, block_size):\n        # model surgery to decrease the block size if necessary\n        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)\n        # but want to use a smaller block size for some smaller, simpler model\n        assert block_size <= self.config.block_size\n        self.config.block_size = block_size\n        self.transformer.wpe.weight = nn.Parameter(\n            self.transformer.wpe.weight[:block_size]\n        )\n        for block in self.transformer.h:\n            if hasattr(block.attn, \"bias\"):\n                block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]\n\n    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):\n        # start with all of the candidate parameters\n        param_dict = {pn: p for pn, p in self.named_parameters()}\n        # filter out those that do not require grad\n        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}\n        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.\n        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.\n        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]\n        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]\n        optim_groups = [\n            {\"params\": decay_params, \"weight_decay\": weight_decay},\n            {\"params\": nodecay_params, \"weight_decay\": 0.0},\n        ]\n        num_decay_params = sum(p.numel() for p in decay_params)\n        num_nodecay_params = sum(p.numel() for p in nodecay_params)\n        print(\n            f\"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters\"\n        )\n        print(\n            f\"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters\"\n        )\n        # Create AdamW optimizer and use the fused version if it is available\n        fused_available = \"fused\" in inspect.signature(torch.optim.AdamW).parameters\n        use_fused = fused_available and device_type == \"cuda\"\n        extra_args = dict(fused=True) if use_fused else dict()\n        optimizer = torch.optim.AdamW(\n            optim_groups, lr=learning_rate, betas=betas, **extra_args\n        )\n        print(f\"using fused AdamW: {use_fused}\")\n\n        return optimizer\n\n    @torch.no_grad()\n    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):\n        \"\"\"\n        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete\n        the sequence max_new_tokens times, feeding the predictions back into the model each time.\n        Most likely you'll want to make sure to be in model.eval() mode of operation for this.\n        \"\"\"\n        for _ in range(max_new_tokens):\n            # if the sequence context is growing too long we must crop it at block_size\n            idx_cond = (\n                idx\n                if idx.size(1) <= self.config.block_size\n                else idx[:, -self.config.block_size:]\n            )\n            # forward the model to get the logits for the index in the sequence\n            logits, _ = self(idx_cond)\n            # pluck the logits at the final step and scale by desired temperature\n            logits = logits[:, -1, :] / temperature\n            # optionally crop the logits to only the top k options\n            if top_k is not None:\n                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))\n                logits[logits < v[:, [-1]]] = -float(\"Inf\")\n            # apply softmax to convert logits to (normalized) probabilities\n            probs = F.softmax(logits, dim=-1)\n            # sample from the distribution\n            idx_next = torch.multinomial(probs, num_samples=1)\n            # append sampled index to the running sequence and continue\n            idx = torch.cat((idx, idx_next), dim=1)\n\n        return idx\n\n\n# --- END model.py ---\ndef train(dataset=\"shakespeare_char\", out_dir=\"run_0\", seed_offset=0):\n    # -----------------------------------------------------------------------------\n    # default config values designed to train a gpt2 (124M) on OpenWebText\n    # data\n    gradient_accumulation_steps = 1\n    batch_size = 64 if dataset == \"shakespeare_char\" else 32\n    block_size = 256  # context of up to 256 previous characters\n    # I/O\n    eval_interval = 250 if dataset == \"shakespeare_char\" else 1000\n    log_interval = 10 if dataset == \"shakespeare_char\" else 100\n    eval_iters = 200\n    eval_only = False  # if True, script exits right after the first eval\n    always_save_checkpoint = False  # we expect to overfit on this small dataset, so only save when val improves\n    never_save_checkpoint = True  # never save checkpoints\n    # model\n    n_layer = 6  # baby GPT model :)\n    n_head = 6\n    n_embd = 384\n    dropout = 0.2  # for pretraining 0 is good, for finetuning try 0.1+\n    bias = False  # do we use bias inside LayerNorm and Linear layers?\n    # adamw optimizer\n    learning_rate = 1e-3 if dataset == \"shakespeare_char\" else 5e-4\n    max_iters = 5000 if dataset == \"shakespeare_char\" else 100000\n    weight_decay = 1e-1\n    beta1 = 0.9\n    beta2 = 0.99  # make a bit bigger because number of tokens per iter is small\n    grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0\n    # learning rate decay settings\n    decay_lr = True  # whether to decay the learning rate\n    warmup_iters = 100 if dataset == \"shakespeare_char\" else 200\n    lr_decay_iters = max_iters  # make equal to max_iters usually\n    min_lr = 1e-4 if dataset == \"shakespeare_char\" else 5e-5\n    # DDP settings\n    backend = \"nccl\"  # 'nccl', 'gloo', etc.\n    # system\n    device = \"cuda\"  # Always use CUDA\n    dtype = (\n        \"bfloat16\"\n        if torch.cuda.is_available() and torch.cuda.is_bf16_supported()\n        else \"float16\"\n    )  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler\n    compile = True  # do not torch compile the model on macbooks\n\n    # various inits, derived attributes, I/O setup\n    # if not ddp, we are running on a single gpu, and one process\n    master_process = True\n    tokens_per_iter = gradient_accumulation_steps * batch_size * block_size\n    print(f\"tokens per iteration will be: {tokens_per_iter:,}\")\n\n    if master_process:\n        os.makedirs(out_dir, exist_ok=True)\n    torch.manual_seed(1337 + seed_offset)\n    torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul\n    torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn\n    device_type = (\n        \"cuda\" if \"cuda\" in device else \"cpu\"\n    )  # for later use in torch.autocast\n    # note: float16 data type will automatically use a GradScaler\n    ptdtype = {\n        \"float32\": torch.float32,\n        \"bfloat16\": torch.bfloat16,\n        \"float16\": torch.float16,\n    }[dtype]\n    ctx = (\n        nullcontext()\n        if device_type == \"cpu\"\n        else torch.amp.autocast(device_type=device_type, dtype=ptdtype)\n    )\n\n    # poor man's data loader\n    if out_dir == \"run_0\":\n        data_dir = os.path.join(\"../../data\", dataset)\n    else:\n        data_dir = os.path.join(\"../../../data\", dataset)\n\n    def get_batch(split):\n        # We recreate np.memmap every batch to avoid a memory leak, as per\n        # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122\n        if split == \"train\":\n            data = np.memmap(\n                os.path.join(data_dir, \"train.bin\"), dtype=np.uint16, mode=\"r\"\n            )\n        else:\n            data = np.memmap(\n                os.path.join(data_dir, \"val.bin\"), dtype=np.uint16, mode=\"r\"\n            )\n        ix = torch.randint(len(data) - block_size, (batch_size,))\n        x = torch.stack(\n            [torch.from_numpy((data[i: i + block_size]).astype(np.int64)) for i in ix]\n        )\n        y = torch.stack(\n            [\n                torch.from_numpy((data[i + 1: i + 1 + block_size]).astype(np.int64))\n                for i in ix\n            ]\n        )\n        if device_type == \"cuda\":\n            # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)\n            x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(\n                device, non_blocking=True\n            )\n        else:\n            x, y = x.to(device), y.to(device)\n        return x, y\n\n    iter_num = 0\n    best_val_loss = 1e9\n\n    # attempt to derive vocab_size from the dataset\n    meta_path = os.path.join(data_dir, \"meta.pkl\")\n    meta_vocab_size = None\n    if os.path.exists(meta_path):\n        with open(meta_path, \"rb\") as f:\n            meta = pickle.load(f)\n        meta_vocab_size = meta[\"vocab_size\"]\n        print(f\"found vocab_size = {meta_vocab_size} (inside {meta_path})\")\n\n    # model init\n    model_args = dict(\n        n_layer=n_layer,\n        n_head=n_head,\n        n_embd=n_embd,\n        block_size=block_size,\n        bias=bias,\n        vocab_size=None,\n        dropout=dropout,\n    )  # start with model_args from command line\n    # init a new model from scratch\n    print(\"Initializing a new model from scratch\")\n    # determine the vocab size we'll use for from-scratch training\n    if meta_vocab_size is None:\n        print(\n            \"defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)\"\n        )\n    model_args[\"vocab_size\"] = meta_vocab_size if meta_vocab_size is not None else 50304\n    gptconf = GPTConfig(**model_args)\n    model = GPT(gptconf)\n    # crop down the model block size if desired, using model surgery\n    if block_size < model.config.block_size:\n        model.crop_block_size(block_size)\n        model_args[\"block_size\"] = (\n            block_size  # so that the checkpoint will have the right value\n        )\n    model.to(device)\n\n    # initialize a GradScaler. If enabled=False scaler is a no-op\n    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == \"float16\"))\n\n    # optimizer\n    optimizer = model.configure_optimizers(\n        weight_decay, learning_rate, (beta1, beta2), device_type\n    )\n    checkpoint = None  # free up memory\n\n    # compile the model\n    if compile:\n        print(\"compiling the model... (takes a ~minute)\")\n        unoptimized_model = model\n        model = torch.compile(model)  # requires PyTorch 2.0\n\n    # helps estimate an arbitrarily accurate loss over either split using many batches\n    @torch.no_grad()\n    def estimate_loss():\n        out = {}\n        model.eval()\n        for split in [\"train\", \"val\"]:\n            losses = torch.zeros(eval_iters)\n            for k in range(eval_iters):\n                X, Y = get_batch(split)\n                with ctx:\n                    logits, loss = model(X, Y)\n                losses[k] = loss.item()\n            out[split] = losses.mean()\n        model.train()\n        return out\n\n    # learning rate decay scheduler (cosine with warmup)\n    def get_lr(it):\n        # 1) linear warmup for warmup_iters steps\n        if it < warmup_iters:\n            return learning_rate * it / warmup_iters\n        # 2) if it > lr_decay_iters, return min learning rate\n        if it > lr_decay_iters:\n            return min_lr\n        # 3) in between, use cosine decay down to min learning rate\n        decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)\n        assert 0 <= decay_ratio <= 1\n        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1\n        return min_lr + coeff * (learning_rate - min_lr)\n\n    # logging\n    val_log_info = []\n    train_log_info = []\n\n    # training loop\n    X, Y = get_batch(\"train\")  # fetch the very first batch\n    og_t0 = time.time()\n    t0 = time.time()\n    local_iter_num = 0  # number of iterations in the lifetime of this process\n    raw_model = model\n    while True:\n\n        # determine and set the learning rate for this iteration\n        lr = get_lr(iter_num) if decay_lr else learning_rate\n        for param_group in optimizer.param_groups:\n            param_group[\"lr\"] = lr\n\n        # evaluate the loss on train/val sets and write checkpoints\n        if iter_num % eval_interval == 0 and master_process:\n            losses = estimate_loss()\n            print(\n                f\"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}\"\n            )\n            val_log_info.append(\n                {\n                    \"iter\": iter_num,\n                    \"train/loss\": losses[\"train\"].item(),\n                    \"val/loss\": losses[\"val\"].item(),\n                    \"lr\": lr,\n                }\n            )\n            if losses[\"val\"] < best_val_loss or always_save_checkpoint:\n                best_val_loss = losses[\"val\"]\n                if iter_num > 0 and not never_save_checkpoint:\n                    checkpoint = {\n                        \"model\": raw_model.state_dict(),\n                        \"optimizer\": optimizer.state_dict(),\n                        \"model_args\": model_args,\n                        \"iter_num\": iter_num,\n                        \"best_val_loss\": best_val_loss,\n                    }\n                    print(f\"saving checkpoint to {out_dir}\")\n                    torch.save(checkpoint, os.path.join(out_dir, \"ckpt.pt\"))\n        if iter_num == 0 and eval_only:\n            break\n\n        # forward backward update, with optional gradient accumulation to simulate larger batch size\n        # and using the GradScaler if data type is float16\n        for micro_step in range(gradient_accumulation_steps):\n            with ctx:\n                logits, loss = model(X, Y)\n                loss = (\n                        loss / gradient_accumulation_steps\n                )  # scale the loss to account for gradient accumulation\n            # immediately async prefetch next batch while model is doing the forward pass on the GPU\n            X, Y = get_batch(\"train\")\n            # backward pass, with gradient scaling if training in fp16\n            scaler.scale(loss).backward()\n        # clip the gradient\n        if grad_clip != 0.0:\n            scaler.unscale_(optimizer)\n            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)\n        # step the optimizer and scaler if training in fp16\n        scaler.step(optimizer)\n        scaler.update()\n        # flush the gradients as soon as we can, no need for this memory anymore\n        optimizer.zero_grad(set_to_none=True)\n\n        # timing and logging\n        t1 = time.time()\n        dt = t1 - t0\n        t0 = t1\n        if iter_num % log_interval == 0 and master_process:\n            # get loss as float. note: this is a CPU-GPU sync point\n            # scale up to undo the division above, approximating the true total loss (exact would have been a sum)\n            lossf = loss.item() * gradient_accumulation_steps\n            print(f\"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms\")\n            train_log_info.append(\n                {\n                    \"iter\": iter_num,\n                    \"loss\": lossf,\n                    \"time\": dt * 1000,\n                }\n            )\n        iter_num += 1\n        local_iter_num += 1\n\n        # termination conditions\n        if iter_num > max_iters:\n            break\n\n    print(\"training done\")\n    print(f\"Best validation loss: {best_val_loss}\")\n    print(f\"Total train time: {(time.time() - og_t0) / 60:.2f} mins\")\n\n    final_info = {\n        \"final_train_loss\": lossf,\n        \"best_val_loss\": best_val_loss.item(),\n        \"total_train_time\": time.time() - og_t0,\n    }\n\n    # === SAMPLING SCRIPT ===\n\n    # New parameters for generation\n    start = \" \"\n    num_samples = 10  # number of samples to draw\n    max_new_tokens = 500  # number of tokens generated in each sample\n    temperature = (\n        0.8  # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions\n    )\n    top_k = 200  # retain only the top_k most likely tokens, clamp others to have 0 probability\n\n    # Encoding setup\n    assert os.path.exists(\n        meta_path\n    ), \"meta.pkl not found, please run training script first\"\n    print(f\"Loading meta from {meta_path}...\")\n    with open(meta_path, \"rb\") as f:\n        meta = pickle.load(f)\n    stoi, itos = meta[\"stoi\"], meta[\"itos\"]\n    encode = lambda s: [stoi[c] for c in s]\n    decode = lambda l: \"\".join([itos[i] for i in l])\n\n    # Encode the beginning of the prompt\n    if start.startswith(\"FILE:\"):\n        with open(start[5:], \"r\", encoding=\"utf-8\") as f:\n            start = f.read()\n    start_ids = encode(start)\n    x = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]\n\n    # Run generation\n    model.eval()\n    results = []\n    with torch.no_grad():\n        with ctx:\n            for k in range(num_samples):\n                start_time = time.time()\n                y = model.generate(\n                    x, max_new_tokens, temperature=temperature, top_k=top_k\n                )\n                end_time = time.time()\n\n                generated_text = decode(y[0].tolist())\n                inference_time = end_time - start_time\n                tokens_per_second = max_new_tokens / inference_time\n\n                print(f\"Sample {k + 1}:\")\n                print(generated_text)\n                print(f\"Inference time: {inference_time:.2f} seconds\")\n                print(f\"Tokens per second: {tokens_per_second:.2f}\")\n                print(\"---------------\")\n\n                results.append(\n                    {\n                        \"sample_id\": k + 1,\n                        \"generated_text\": generated_text,\n                        \"inference_time\": inference_time,\n                        \"tokens_per_second\": tokens_per_second,\n                    }\n                )\n\n    # Calculate and print average inference speed\n    avg_tokens_per_second = sum(r[\"tokens_per_second\"] for r in results) / len(results)\n    print(f\"Average tokens per second: {avg_tokens_per_second:.2f}\")\n\n    final_info[\"avg_inference_tokens_per_second\"] = avg_tokens_per_second\n\n    with open(\n            os.path.join(out_dir, f\"final_info_{dataset}_{seed_offset}.json\"), \"w\"\n    ) as f:\n        json.dump(final_info, f)\n    return final_info, train_log_info, val_log_info\n\n\nparser = argparse.ArgumentParser(description=\"Run experiment\")\nparser.add_argument(\"--out_dir\", type=str, default=\"run_0\", help=\"Output directory\")\nargs = parser.parse_args()\n\nif __name__ == \"__main__\":\n    num_seeds = {\n        \"shakespeare_char\": 2,\n    }\n\n    out_dir = args.out_dir\n    all_results = {}\n    final_infos = {}\n    for dataset in num_seeds.keys():\n        final_info_list = []\n        for seed_offset in range(num_seeds[dataset]):\n            final_info, train_info, val_info = train(dataset, out_dir, seed_offset)\n            all_results[f\"{dataset}_{seed_offset}_final_info\"] = final_info\n            all_results[f\"{dataset}_{seed_offset}_train_info\"] = train_info\n            all_results[f\"{dataset}_{seed_offset}_val_info\"] = val_info\n            final_info_list.append(final_info)\n        final_info_dict = {\n            k: [d[k] for d in final_info_list] for k in final_info_list[0].keys()\n        }\n        means = {f\"{k}_mean\": np.mean(v) for k, v in final_info_dict.items()}\n        stderrs = {\n            f\"{k}_stderr\": np.std(v) / len(v) for k, v in final_info_dict.items()\n        }\n        final_infos[dataset] = {\n            \"means\": means,\n            \"stderrs\": stderrs,\n            \"final_info_dict\": final_info_dict,\n        }\n\n    with open(os.path.join(out_dir, \"final_info.json\"), \"w\") as f:\n        json.dump(final_infos, f)\n\n    with open(os.path.join(out_dir, \"all_results.npy\"), \"wb\") as f:\n        np.save(f, all_results)\n",
+        "seed_ideas": [
+          {
+            "name": "adaptive_block_size",
+            "title": "Adaptive Block Size: Dynamic Context Window Adjustment for Efficient Training",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 6,
+            "feasibility": 4,
+            "novelty": 4
+          },
+          {
+            "name": "layerwise_learning_rates",
+            "title": "Layer-wise Learning Rate Adaptation: Optimizing Training Dynamics in Transformer Models",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 4,
+            "feasibility": 6,
+            "novelty": 2
+          },
+          {
+            "name": "attention_diversity_regularization",
+            "title": "Attention Diversity Regularization: Encouraging Diverse Context Window Utilization in Transformers",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 7,
+            "feasibility": 6,
+            "novelty": 5
+          },
+          {
+            "name": "ntm_augmented_transformer",
+            "title": "Neural Turing Machine-Augmented Transformer: Improving Text Generation with External Memory",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 6
+          },
+          {
+            "name": "uncertainty_based_filtering",
+            "title": "Uncertainty-Based Filtering: Reducing Hallucinations in Text Generation by Selecting High-Certainty Predictions",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 6
+          },
+          {
+            "name": "targeted_knowledge_distillation",
+            "title": "Targeted Knowledge Distillation for Transformer-Based Language Models: A Study on Distilling Specific Aspects of Model Behavior",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 7
+          },
+          {
+            "name": "fine_tuning_gpt",
+            "title": "Fine-Tuning for Task Adaptation: A Study on Adapting Pre-Trained GPT Models to New Tasks",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 6
+          },
+          {
+            "name": "training_data_ordering",
+            "title": "The Impact of Training Data Ordering on Language Model Performance",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 7
+          },
+          {
+            "name": "memory_buffer_transformer",
+            "title": "Memory Buffer Transformer: Improving Long-Range Dependency Modeling with a Simple Memory Mechanism",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 7
+          },
+          {
+            "name": "meta_attention_gpt",
+            "title": "Meta-Learning for Adaptive Attention in GPT Models",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "word_dropout_auxiliary_task",
+            "title": "Word Dropout Auxiliary Task: Improving Language Understanding through Multi-Task Learning",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 7
+          },
+          {
+            "name": "temporal_regularization",
+            "title": "Temporal Regularization for Mitigating Catastrophic Forgetting in Language Models",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 7
+          },
+          {
+            "name": "graph_augmented_gpt",
+            "title": "Graph-Augmented GPT for Improved Entity Relationship Modeling",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 7
+          },
+          {
+            "name": "bias_aware_gpt",
+            "title": "Bias-Aware GPT: A Self-Aware Language Model for Mitigating Biases",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "multi_objective_gpt",
+            "title": "Multi-Objective Optimization for GPT Models: A Study on Language Modeling and Sentiment Analysis",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "attention_dropout_transformer",
+            "title": "Attention Dropout Transformer: Regularizing the Model with Targeted Dropout",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 7
+          },
+          {
+            "name": "domain_knowledge_graph_gpt",
+            "title": "Domain-Specific Knowledge Graph-Augmented GPT for Improved Reasoning and Inference",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 7
+          },
+          {
+            "name": "difficulty_aware_sampling",
+            "title": "Difficulty-Aware Sampling for Language Modeling: A Study on Dynamic Learning Objectives",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 7
+          },
+          {
+            "name": "discrete_time_echo_state_gpt",
+            "title": "Discrete-Time Echo State Networks for Efficient Temporal Modeling in GPT",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 8
+          },
+          {
+            "name": "input_complexity_adaptation",
+            "title": "Input Complexity Adaptation for Efficient Language Modeling",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 7
+          },
+          {
+            "name": "linguistic_complexity_manipulation",
+            "title": "Linguistic Complexity Manipulation for Language Models: A Study on Performance and Generalization",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "temporal_knowledge_forgetting_gpt",
+            "title": "Temporal Knowledge Forgetting in Language Models: A Study on Adapting to Sudden Changes in Data Distributions",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "monte_carlo_confidence_aware_gpt",
+            "title": "Monte Carlo Confidence-Aware GPT: Estimating Uncertainty via Dropout",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "calibrated_confidence_aware_gpt",
+            "title": "Calibrated Confidence-Aware GPT: Estimating Uncertainty in Language Modeling",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "factual_knowledge_neurons",
+            "title": "Identifying Factual Knowledge Neurons in Language Models",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "domain_adaptation_meta_learning",
+            "title": "Domain Adaptation via Meta-Learning for Language Modeling",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "dual_scale_attention_gpt",
+            "title": "Dual-Scale Attention in GPT: Capturing Long-Range Dependencies with Sparse Attention",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 7
+          },
+          {
+            "name": "multimodal_emotionally_intelligent_gpt",
+            "title": "Multimodal Emotionally Intelligent GPT: Generating Text that Understands and Expresses Emotions",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "availability_heuristic_gpt",
+            "title": "Availability Heuristic-Aware GPT: Simulating Human-Like Conversational Flow in Language Generation",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "interpretable_dynamic_attention_gpt",
+            "title": "Interpretable Dynamic Attention GPT: A Multi-Task Learning Approach to Adaptive Context Window Size",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 8
+          },
+          {
+            "name": "recency_effect_gpt",
+            "title": "Recency Effect-Aware GPT: Simulating Human-Like Decision-Making in Language Generation",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "idiomatic_gpt",
+            "title": "Idiomatic GPT: A Language Model with Idiom Recognition and Generation",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 8
+          },
+          {
+            "name": "selective_forgetting_gpt",
+            "title": "Selective Forgetting in GPT: A Novel Approach to Memory Consolidation",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 8
+          },
+          {
+            "name": "syntactic_complexity_analysis",
+            "title": "Syntactic Complexity Analysis in Language Models",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "linguistic_difficulty_gpt",
+            "title": "Linguistic Difficulty-Aware GPT: Using Linguistic Features to Predict Input Text Complexity",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "linguistic_complexity_aware_gpt",
+            "title": "Linguistic Complexity-Aware GPT: Improving Performance on Complex Input Texts",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "recency_effect_gpt",
+            "title": "Incorporating the Recency Effect into Language Models for More Coherent and Context-Dependent Text Generation",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "dynamic_attention_gpt",
+            "title": "Dynamic Attention GPT: Adapting to Varying Levels of Cognitive Load",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "primacy_effect_gpt",
+            "title": "The Primacy Effect in Language Models: Exploring the Impact on Text Completion",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 7
+          },
+          {
+            "name": "novelty_conditioned_gpt",
+            "title": "Novelty-Conditioned GPT: Adjusting Language Generation based on Input Novelty",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "availability_heuristic_gpt",
+            "title": "Availability Heuristic in GPT: Exploring the Impact of Recent Information on Language Generation",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "frequency_based_forgetting_gpt",
+            "title": "Frequency-Based Forgetting in GPT: Exploring the Impact of Forgetting on Language Model Performance",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "curiosity_driven_gpt",
+            "title": "Curiosity-Driven Language Modeling: Exploring Novel Patterns in Input Data",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "semantic_drift_analysis",
+            "title": "Semantic Drift Analysis in Language Models: A Study on Temporal Changes in Text",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 8
+          },
+          {
+            "name": "syntactic_complexity_aware_gpt",
+            "title": "Syntactic Complexity-Aware GPT: Adapting Attention to Syntactic Complexity",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "entity_relationship_gpt",
+            "title": "Entity Relationship-Augmented GPT: Improving Reasoning about Entities and Relationships",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 8
+          },
+          {
+            "name": "meta_forgetting_gpt",
+            "title": "Meta-Forgetting in Language Models: A Study on Intentional Forgetting for Improved Generalization",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "domain_invariant_reps",
+            "title": "Learning Domain-Invariant Representations for Language Modeling",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 7,
+            "novelty": 8
+          },
+          {
+            "name": "information_density_aware_gpt",
+            "title": "Information Density-Aware GPT: Adapting Attention to Information Density",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "syntactic_complexity_aware_gpt",
+            "title": "Syntactic Complexity-Aware GPT: Adapting Attention to Syntactic Complexity",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "cognitive_load_aware_gpt",
+            "title": "Cognitive Load-Aware GPT: Adapting Attention to Cognitive Load",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "contrastive_forgetting_gpt",
+            "title": "Contrastive Forgetting in Language Models: Preserving General Knowledge while Forgetting Domain-Specific Patterns",
+            "experiment": "nanoGPT_lite",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 8
+          }
+        ]
+      }
+    },
+    {
+      "id": "slowly_overly_cool_orca",
+      "experiment": {
+        "name": "seir",
+        "task_description": "You are given the following file to work with, which run the SEIR infection model.",
+        "init_code": "import argparse\nimport json\nimport os\n\nimport numpy as np\nfrom scipy.integrate import odeint\n\n# -----------------------------------------------------------------------------\n# SEIR model is a differential equation model that describes the dynamics of infectious diseases such as COVID-19.\n# The model divides the population into four compartments: S (susceptible), E (exposed), I (infectious), and R (recovered).\n# -----------------------------------------------------------------------------\n\n\nparser = argparse.ArgumentParser(description=\"Run experiment\")\nparser.add_argument(\"--out_dir\", type=str, default=\"run_0\", help=\"Output directory\")\nargs = parser.parse_args()\n\nif __name__ == \"__main__\":\n    out_dir = args.out_dir\n    os.makedirs(out_dir, exist_ok=True)\n\n\n    def seir_eq(v, t, beta, lp, ip):\n        \"\"\"Differential equation of SEIR model\n        v: [S, E, I, R] Distribution of people in each state\n        t: Time\n        beta: Infection rate\n        lp: Latent period\n        ip: Infectious period\n        \"\"\"\n        dS = -beta * v[0] * v[2]\n        dE = beta * v[0] * v[2] - (1 / lp) * v[1]\n        dI = (1 / lp) * v[1] - (1 / ip) * v[2]\n        dR = (1 / ip) * v[2]\n        return np.array([dS, dE, dI, dR])\n\n\n    # Solve SEIR model\n    init_state = np.array([3000, 0, 5, 0])\n    solution = odeint(\n        seir_eq,\n        init_state,\n        t=np.arange(0, 100, 1),\n        args=(0.001, 14, 7),\n    )\n\n    means = {\n        \"infected_peak_day\": np.argmax(solution[:, 2]).item(),\n        \"infected_peak\": np.max(solution[:, 2]).item(),\n        \"total_infected\": solution[-1, 3].item(),\n    }\n\n    final_info = {\n        \"SEIR\": {\n            \"means\": means,  # means is used in the experiment\n            \"solution\": solution.tolist(),  # solution is used in the visualization\n        }\n    }\n    with open(os.path.join(out_dir, \"final_info.json\"), \"w\") as f:\n        json.dump(final_info, f)\n",
+        "seed_ideas": [
+          {
+            "name": "threshold_behavioral_response_seir",
+            "title": "Modeling Threshold-Based Behavioral Responses in SEIR Dynamics",
+            "experiment": "seir",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 9
+          },
+          {
+            "name": "vaccination_strategy_seir",
+            "title": "Incorporating Vaccination Strategies into SEIR Dynamics",
+            "experiment": "seir",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "dynamic_social_distancing_seir",
+            "title": "Modeling Dynamic Social Distancing Responses in SEIR Dynamics",
+            "experiment": "seir",
+            "interestingness": 9,
+            "feasibility": 9,
+            "novelty": 9
+          }
+        ]
+      }
+    },
+    {
+      "id": "purely_early_vital_robin",
+      "experiment": {
+        "name": "sketch_rnn",
+        "task_description": "You are given the following file to work with, that trains a low-dimensional autoregressive recurent neural network that generates sketch drawings. Particulary interesting ideas would improve the quality of generation without increasing the dimensions of the network or increasing the diversity of generations such that produced drawings are not all similar.",
+        "init_code": "# This file trains a Sketch RNN (https://arxiv.org/abs/1704.03477).\n\nimport argparse\nimport json\nimport os.path as osp\nimport pathlib\nimport pickle\nimport time\nfrom dataclasses import dataclass\n\nimport numpy as np\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport torch.optim as optim\n\nimport utils\n\n\n@dataclass\nclass State:\n    \"\"\"Probability distribution parameters for the next pen move.\"\"\"\n    mixture_logits: torch.Tensor\n    mu_x: torch.Tensor\n    mu_y: torch.Tensor\n    sigma_x: torch.Tensor\n    sigma_y: torch.Tensor\n    rho_xy: torch.Tensor\n    pen_logits: torch.Tensor\n\n\ndef sample_from_state(state, temperature, device):\n    \"\"\"Sample a pen move from the current state, and update the state.\"\"\"\n    # Sample a mixture.\n    mixture_logits = state.mixture_logits.data.cpu().numpy()\n    mixture_weights = utils.apply_temperature(mixture_logits, temperature)\n    mixture_idx = np.random.choice(mixture_weights.size, p=mixture_weights)\n    # Sample mixture params.\n    mu_x = state.mu_x.data[mixture_idx].cpu()\n    mu_y = state.mu_y.data[mixture_idx].cpu()\n    sigma_x = state.sigma_x.data[mixture_idx].cpu()\n    sigma_y = state.sigma_y.data[mixture_idx].cpu()\n    rho_xy = state.rho_xy.data[mixture_idx].cpu()\n    # Sample x, y with mixture.\n    x, y = utils.sample_bivariate_normal(\n        mu_x, mu_y, sigma_x, sigma_y, rho_xy, temperature,\n    )\n    # Sample pen state.\n    pen_logits = state.pen_logits.data.cpu().numpy()\n    pen_weights = utils.apply_temperature(pen_logits, temperature)\n    pen_state_idx = np.random.choice(3, p=pen_weights)\n    # Construct new decoder input state.\n    next_state = torch.zeros(5)\n    next_state[0] = x\n    next_state[1] = y\n    next_state[pen_state_idx + 2] = 1\n    return (\n        next_state.view(1, 1, -1).to(device),\n        x, y, pen_state_idx == 1, pen_state_idx == 2,\n    )\n\n\ndef compute_reconstruction_loss(state, targets):\n    \"\"\"Maximum likelihood of probability(target).\"\"\"\n    num_mixtures = state.mu_x.size()[-1]\n    dx = torch.stack([targets.data[:, :, 0]] * num_mixtures, dim=2)\n    dy = torch.stack([targets.data[:, :, 1]] * num_mixtures, dim=2)\n    pen_state = targets.data[:, :, 2:]\n    mask = 1 - pen_state[:, :, -1]\n    pdf_logits = utils.bivariate_normal_pdf(\n        dx, dy,\n        state.mu_x, state.mu_y, state.sigma_x, state.sigma_y, state.rho_xy\n    )\n    llh_xy = -torch.sum(\n        mask * torch.logsumexp(state.mixture_logits + pdf_logits, dim=2)\n    )\n    llh_pen = -torch.sum(pen_state * state.pen_logits)\n    return (llh_xy + llh_pen) / float(np.prod(mask.size()))\n\n\ndef compute_kl_loss(sigma, mu, kl_min):\n    \"\"\"KL between distribution of latent signals and IID N(0, I).\"\"\"\n    kl_loss = -0.5 * (\n        torch.sum(1 + sigma - mu ** 2 - torch.exp(sigma))\n    ) / float(np.prod(sigma.size()))\n    if kl_loss < kl_min:\n        return kl_loss.detach()\n    return kl_loss\n\n\nclass EncoderRNN(nn.Module):\n    def __init__(self, config):\n        super(EncoderRNN, self).__init__()\n        self.hidden_size = config.encoder_hidden_size\n        self.device = config.device\n        # Bidirectional lstm:\n        self.lstm = nn.LSTM(\n            input_size=5,  # dx dy pen-down pen-up end.\n            hidden_size=config.encoder_hidden_size,\n            bidirectional=True\n        )\n        # Create mu and sigma from lstm's last output:\n        self.fc_mu = nn.Linear(2 * self.hidden_size, config.latent_size)\n        self.fc_sigma = nn.Linear(2 * self.hidden_size, config.latent_size)\n\n    def forward(self, inputs, batch_size, hidden_cell_pair=None):\n        if hidden_cell_pair is None:\n            # Initialize with zeros.\n            hidden = torch.zeros(2, batch_size, self.hidden_size)\n            cell = torch.zeros(2, batch_size, self.hidden_size)\n            hidden_cell_pair = (hidden.to(self.device), cell.to(self.device))\n\n        _, (hidden, cell) = self.lstm(inputs.float(), hidden_cell_pair)\n        # hidden is (2, batch_size, hidden_size),\n        # we want it to be (batch_size, 2 * hidden_size):\n        hidden_forward, hidden_backward = torch.split(hidden, 1, 0)\n        hidden_forward_backward = torch.cat(\n            [hidden_forward.squeeze(0), hidden_backward.squeeze(0)], dim=1\n        )\n        # mu and sigma:\n        mu = self.fc_mu(hidden_forward_backward)\n        sigma_hat = self.fc_sigma(hidden_forward_backward)\n        sigma = torch.exp(sigma_hat / 2.)\n        # noise ~ N(0, 1)\n        noise = torch.normal(torch.zeros(mu.size()), torch.ones(mu.size()))\n        latent_signal = mu + sigma * noise.to(self.device)\n        # mu and sigma_hat are needed for kl loss\n        return latent_signal, mu, sigma_hat\n\n\nclass DecoderRNN(nn.Module):\n    def __init__(self, config):\n        super(DecoderRNN, self).__init__()\n        self.hidden_size = config.decoder_hidden_size\n        # FC layer used to initialize hidden and cell from a latent signal:\n        self.fc_hidden_cell = nn.Linear(\n            config.latent_size, 2 * self.hidden_size\n        )\n        # Unidirectional lstm:\n        self.lstm = nn.LSTM(\n            input_size=config.latent_size + 5,\n            hidden_size=config.decoder_hidden_size,\n        )\n        # FC that predict Mixture's parameters from hiddens activations.\n        # The number of parameters is:\n        # 5 * M (x and y means, x and y variances, xy covariances) \n        # + M (mixture weights) \n        # + 3 (pen-down, pen-up, end).\n        self.num_params = 6 * config.num_mixtures + 3\n        self.fc_mixture = nn.Linear(self.hidden_size, self.num_params)\n\n    def forward(self, inputs, latent_signal, hidden_cell_pair=None):\n        if hidden_cell_pair is None:\n            # Initialize with latent signal.\n            hidden_cell = F.tanh(self.fc_hidden_cell(latent_signal))\n            hidden, cell = torch.split(hidden_cell, self.hidden_size, 1)\n            # Remove unused first axis.\n            hidden_cell_pair = (\n                hidden.unsqueeze(0).contiguous(), cell.unsqueeze(0).contiguous()\n            )\n        outputs, (hidden, cell) = self.lstm(inputs, hidden_cell_pair)\n        if self.training:\n            # Teacher forcing mode: use whole output sequence.\n            params = self.fc_mixture(outputs)\n        else:\n            # Inference mode: use last updated hidden signal.\n            params = self.fc_mixture(hidden)\n        # Separate pen and mixture params.\n        params_sets = torch.split(params, 6, dim=-1)\n        params_mixture = torch.stack(params_sets[:-1], dim=-1)  # Trajectory.\n        pen_logits = params_sets[-1]  # Pen up/down + end.\n        # Identify mixture params:\n        mixture_logits, mu_x, mu_y, sigma_x, sigma_y, rho_xy = torch.split(\n            params_mixture, 1, dim=2\n        )\n        return State(\n            mixture_logits=F.log_softmax(mixture_logits.squeeze(), dim=-1),\n            mu_x=mu_x.squeeze(),\n            mu_y=mu_y.squeeze(),\n            sigma_x=torch.exp(sigma_x.squeeze()),\n            sigma_y=torch.exp(sigma_y.squeeze()),\n            rho_xy=torch.tanh(rho_xy.squeeze()),\n            pen_logits=F.log_softmax(pen_logits.squeeze(), dim=-1),\n        ), hidden, cell\n\n\nclass Model():\n    def __init__(self, config):\n        self.device = config.device\n        self.batch_size = config.batch_size\n        self.grad_clip = config.grad_clip\n        self.latent_size = config.latent_size\n        self.sequence_length = config.sequence_length\n        self.temperature = config.temperature\n        # Build encoder and decoder and their optimizers.\n        self.encoder = EncoderRNN(config).to(self.device)\n        self.decoder = DecoderRNN(config).to(self.device)\n        self.encoder_optimizer = optim.Adam(\n            self.encoder.parameters(), config.learning_rate\n        )\n        self.decoder_optimizer = optim.Adam(\n            self.decoder.parameters(), config.learning_rate\n        )\n\n        # Function to decay optimizers.\n        def _decay(optimizer):\n            for param_group in optimizer.param_groups:\n                if param_group['lr'] > config.min_learning_rate:\n                    param_group['lr'] *= config.learning_rate_decay_factor\n\n        self.decay = _decay\n        # kl loss parameters\n        self.initial_kl_weight = config.initial_kl_weight\n        self.kl_weight_decay = 1\n        self.kl_weight_decay_factor = config.kl_weight_decay_factor\n        self.kl_min = config.kl_min\n        # eos and sos tokens:\n        self.eos = (\n            torch.stack([torch.Tensor([0, 0, 0, 0, 1])] * config.batch_size)\n        ).unsqueeze(0).to(self.device)\n        self.sos = (\n            torch.stack([torch.Tensor([0, 0, 1, 0, 0])] * config.batch_size)\n        ).unsqueeze(0).to(self.device)\n\n    def train(self, sequences):\n        self.encoder.train()\n        self.decoder.train()\n        # Encode sequences and update hidden variables mu and sigma.\n        latent_signal, mu, sigma = self.encoder(sequences, self.batch_size)\n        # Prepare decoder's input:\n        # Put the sos token at the beggining.\n        inputs = torch.cat([self.sos, sequences], 0)\n        # Expend latent signal to be ready to concatenate with inputs.\n        latent_signal_stack = torch.stack(\n            [latent_signal] * (self.sequence_length + 1),\n        )\n        # Decoder input is concatenation of latent signal and sequence inputs.\n        decoder_input = torch.cat([inputs, latent_signal_stack], dim=2)\n        # Decode:\n        state, _, _ = self.decoder(decoder_input, latent_signal)\n        # Update kl weight.\n        self.kl_weight = 1 - (1 - self.initial_kl_weight) * self.kl_weight_decay\n        self.kl_weight_decay *= self.kl_weight_decay_factor\n        # Compute losses.\n        kl_loss = compute_kl_loss(mu, sigma, self.kl_min)\n        targets = torch.cat([sequences, self.eos], dim=0).detach()\n        reconstruction_loss = compute_reconstruction_loss(state, targets)\n        loss = reconstruction_loss + self.kl_weight * kl_loss\n        # Compute gradients.\n        loss.backward()\n        # Gradient cliping.\n        nn.utils.clip_grad_norm_(self.encoder.parameters(), self.grad_clip)\n        nn.utils.clip_grad_norm_(self.decoder.parameters(), self.grad_clip)\n        # Optimizers steps.\n        self.encoder_optimizer.step()\n        self.decoder_optimizer.step()\n        # Apply learning rate decay.\n        self.decay(self.encoder_optimizer)\n        self.decay(self.decoder_optimizer)\n        # Flush optimizers.\n        self.encoder_optimizer.zero_grad(set_to_none=True)\n        self.decoder_optimizer.zero_grad(set_to_none=True)\n        return (\n            loss.detach().cpu().numpy(),\n            reconstruction_loss.detach().cpu().numpy(),\n            kl_loss.detach().cpu().numpy(),\n        )\n\n    def sample(self, context=None):\n        \"\"\"Samples a sequence of strokes.\"\"\"\n        self.encoder.eval()\n        self.decoder.eval()\n        if context is not None:\n            # Condition generation with encoded context.\n            latent_signal, _, _ = self.encoder(context, 1)\n        else:\n            latent_signal = torch.normal(\n                torch.zeros(self.latent_size), torch.ones(self.latent_size)\n            ).to(self.device).view(1, -1)\n        sos = torch.Tensor([0, 0, 1, 0, 0]).view(1, 1, -1).to(self.device)\n        input = sos\n        seq_x, seq_y, seq_z = [], [], []\n        hidden_cell = None\n        for _ in range(self.sequence_length):\n            decoder_input = torch.cat(\n                [input, latent_signal.unsqueeze(0)], dim=2\n            )\n            # Decode:\n            state, hidden, cell = self.decoder(\n                decoder_input, latent_signal, hidden_cell\n            )\n            hidden_cell = (hidden, cell)\n            # Sample from parameters and update state.\n            input, dx, dy, pen_down, eos = sample_from_state(\n                state, self.temperature, self.device\n            )\n            # Append sampled stroke to generated sequence.\n            seq_x.append(dx)\n            seq_y.append(dy)\n            seq_z.append(pen_down)\n            if eos:\n                break\n        # Visualize resulting sequence of strokes:\n        x_sample = np.cumsum(seq_x, 0)\n        y_sample = np.cumsum(seq_y, 0)\n        z_sample = np.array(seq_z)\n        return np.stack([x_sample, y_sample, z_sample]).T\n\n\nif __name__ == \"__main__\":\n\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"--device\", type=str, default=\"cuda\")\n    parser.add_argument(\"--sequence_length\", type=int, default=100)\n    parser.add_argument(\"--encoder_hidden_size\", type=int, default=128)\n    parser.add_argument(\"--decoder_hidden_size\", type=int, default=512)\n    parser.add_argument(\"--latent_size\", type=int, default=128)\n    parser.add_argument(\"--num_mixtures\", type=int, default=20)\n    parser.add_argument(\"--batch_size\", type=int, default=32)\n    parser.add_argument(\"--learning_rate\", type=float, default=1e-3)\n    parser.add_argument(\n        \"--learning_rate_decay_factor\", type=float, default=0.9999\n    )\n    parser.add_argument(\"--grad_clip\", type=float, default=1.)\n    parser.add_argument(\"--min_learning_rate\", type=float, default=1e-5)\n    parser.add_argument(\"--max_steps\", type=int, default=5000)\n    parser.add_argument(\"--initial_kl_weight\", type=float, default=0.01)\n    parser.add_argument(\"--kl_weight_decay_factor\", type=float, default=0.99999)\n    parser.add_argument(\"--kl_min\", type=float, default=0.2)\n    parser.add_argument(\"--temperature\", type=float, default=0.4)\n    parser.add_argument(\"--out_dir\", type=str, default=\"run_0\")\n    config = parser.parse_args()\n\n    final_infos = {}\n    all_results = {}\n\n    pathlib.Path(config.out_dir).mkdir(parents=True, exist_ok=True)\n\n    for dataset_name in [\"cat\", \"butterfly\", \"yoga\", \"owl\"]:\n\n        # Prepare model\n        if config.device == 'cuda':\n            assert torch.cuda.is_available(), (\n                \"Device set to cuda, but cuda is unavailable.\"\n            )\n        model = Model(config)\n        print(\"compiling the model... (takes a ~minute)\")\n        model.encoder = torch.compile(model.encoder)\n        model.decoder = torch.compile(model.decoder)\n\n        # Prepare data\n        dataset = utils.get_dataset(dataset_name, config.sequence_length)\n        get_batch = utils.get_batch_factory(\n            dataset,\n            config.sequence_length,\n            config.device\n        )\n\n        # training loop\n        train_reconstruction_losses = []\n        train_kl_losses = []\n        train_losses = []\n        train_step_times = []\n        for step in range(config.max_steps):\n            batch = get_batch(config.batch_size)\n            step_time = time.time()\n            loss, reconstruction_loss, kl_loss = model.train(batch)\n            train_step_time = time.time() - step_time\n            train_reconstruction_losses.append(reconstruction_loss)\n            train_kl_losses.append(kl_loss)\n            train_losses.append(loss)\n            train_step_times.append(train_step_time)\n            if step % 100 == 0:\n                print(\n                    f'step {step}, loss {loss:.4f}',\n                    f', recons. loss {reconstruction_loss:.4f}',\n                    f', kl_loss {kl_loss:.4f}',\n                    f', train_step_time {train_step_time:.4f}',\n                )\n\n        final_infos[dataset_name] = {\n            \"means\": {\n                \"train_step_time\": float(np.mean(train_step_times)),\n                \"loss\": float(loss),\n                \"reconstruction_loss\": float(reconstruction_loss),\n                \"kl_loss\": float(kl_loss),\n            }\n        }\n\n        # Save drawing.\n        context = get_batch(1)\n        all_results[dataset_name] = {\n            \"train_losses\": train_losses,\n            \"train_reconstruction_losses\": train_reconstruction_losses,\n            \"train_kl_losses\": train_kl_losses,\n            \"conditioned_sequence\": model.sample(context),\n            \"unconditioned_sequence\": model.sample(),\n        }\n\n    with open(osp.join(config.out_dir, \"final_info.json\"), \"w\") as f:\n        json.dump(final_infos, f)\n\n    with open(osp.join(config.out_dir, \"all_results.pkl\"), \"wb\") as f:\n        pickle.dump(all_results, f)\n",
+        "seed_ideas": [
+          {
+            "name": "latent_space_decorrelation",
+            "title": "Enhancing Sketch Diversity through Latent Space Decorrelation",
+            "experiment": "sketch_rnn",
+            "interestingness": 8,
+            "feasibility": 9,
+            "novelty": 7
+          },
+          {
+            "name": "temporal_smoothing_loss",
+            "title": "Enhancing Sketch Generation with Temporal Smoothing Loss",
+            "experiment": "sketch_rnn",
+            "interestingness": 7,
+            "feasibility": 9,
+            "novelty": 7
+          },
+          {
+            "name": "attention_mechanism",
+            "title": "Enhancing Sketch Generation with Attention Mechanism",
+            "experiment": "sketch_rnn",
+            "interestingness": 9,
+            "feasibility": 8,
+            "novelty": 8
+          },
+          {
+            "name": "adaptive_dropout",
+            "title": "Improving Sketch Generation with Adaptive Dropout",
+            "experiment": "sketch_rnn",
+            "interestingness": 8,
+            "feasibility": 8,
+            "novelty": 7
+          }
+        ]
+      }
+    }
+  ]
+}
