@@ -142,5 +142,65 @@
     "status": "completed",
     "start_time": "2024-10-29T00:23:14.484252",
     "end_time": "2024-10-29T00:23:22.736310"
+  },
+  {
+    "run_id": "hugely_wildly_flying_beagle",
+    "status": "failed",
+    "start_time": "2024-10-29T12:30:47.200205",
+    "end_time": "2024-10-29T12:30:53.452364"
+  },
+  {
+    "run_id": "yearly_solely_light_hippo",
+    "status": "failed",
+    "start_time": "2024-10-29T12:34:02.820934",
+    "end_time": "2024-10-29T12:34:08.769742"
+  },
+  {
+    "run_id": "gently_sadly_still_mayfly",
+    "status": "failed",
+    "start_time": "2024-10-29T12:39:04.906881",
+    "end_time": "2024-10-29T12:39:11.496600"
+  },
+  {
+    "run_id": "badly_namely_large_chow",
+    "status": "failed",
+    "start_time": "2024-10-29T12:47:13.960052",
+    "end_time": "2024-10-29T12:47:19.326567"
+  },
+  {
+    "run_id": "freely_easily_proud_shrew",
+    "status": "failed",
+    "start_time": "2024-10-29T16:32:17.236570",
+    "end_time": "2024-10-29T16:32:23.870602"
+  },
+  {
+    "run_id": "oddly_hugely_modern_swine",
+    "status": "completed",
+    "start_time": "2024-10-29T16:35:00.223168",
+    "end_time": "2024-10-29T16:35:16.321206"
+  },
+  {
+    "run_id": "highly_mildly_hardy_pup",
+    "status": "completed",
+    "start_time": "2024-10-29T16:44:51.987257",
+    "end_time": "2024-10-29T16:44:59.373818"
+  },
+  {
+    "run_id": "evenly_slowly_prime_prawn",
+    "status": "failed",
+    "start_time": "2024-10-29T16:46:30.921179",
+    "end_time": "2024-10-29T16:46:30.953201"
+  },
+  {
+    "run_id": "purely_badly_able_eft",
+    "status": "failed",
+    "start_time": "2024-10-29T16:47:10.198571",
+    "end_time": "2024-10-29T16:47:10.228377"
+  },
+  {
+    "run_id": "partly_lately_moving_beetle",
+    "status": "completed",
+    "start_time": "2024-10-29T16:50:31.347973",
+    "end_time": "2024-10-29T16:50:43.447130"
   }
 ]

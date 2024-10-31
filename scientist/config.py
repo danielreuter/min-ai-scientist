@@ -4,7 +4,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from langfuse import Langfuse
 
-from reagency import AI, OpenAIProvider
+from agentlens import AI, OpenAIProvider
 
 load_dotenv()
 

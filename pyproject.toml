@@ -1,28 +1,32 @@
 [tool.poetry]
-name = "reagency"
+name = "scientist"
 version = "0.1.0"
-description = "lightweight abstractions for building agent scaffolds"
+description = "ai scientist"
 authors = ["danielreuter <dreuter14@gmail.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = ">=3.10,<3.13"
 langfuse = "^2.52.1"
 mypy = "^1.12.1"
-openai = "^1.52.1"
+openai = "1.47.0"
 anthropic = "^0.37.1"
 petname = "^2.6"
 python-dotenv = "^1.0.1"
 tenacity = "^9.0.0"
-pillow = "^11.0.0"
+pillow = "10.4.0"
 joblib = "^1.4.2"
 pytest-asyncio = "^0.24.0"
 nest-asyncio = "^1.6.0"
-numpy = "^2.1.2"
+numpy = "1.26.4"
 torch = "^2.5.0"
 einops = "^0.8.0"
-tqdm = "^4.66.6"
-agentlens = "0.1.2"
+tqdm = "4.66.5"
+ruff = "^0.7.1"
+agentlens = "^0.1.6"
+aider-chat = "^0.60.1"
+pymupdf4llm = "^0.0.17"
+pypdf = "^5.1.0"
 
 
 [tool.poetry.group.dev.dependencies]

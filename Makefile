@@ -2,7 +2,7 @@
 check:
 	ruff check --fix
 	ruff format
-	mypy reagency tests example
+	mypy scientist tests example
 
 .PHONY: test
 test:
